@@ -285,6 +285,11 @@ contain the following `escape sequences`:idx:\ :
   ``\e``                   `escape`:idx: `[ESC]`:idx:
   ``\x`` HH                `character with hex value HH`:idx:;
                            exactly two hex digits are allowed
+  ``\u`` HHHH              `unicode codepoint with hex value HHHH`:idx:;
+                           exactly four hex digits are allowed
+  ``\u`` {H+}              `unicode codepoint`:idx:;
+                           all hex digits enclosed in ``{}`` are used for
+                           the codepoint
 ==================         ===================================================
 
 
@@ -508,6 +513,9 @@ are used for other notational purposes.
 
 ``*:`` is as a special case treated as the two tokens `*`:tok: and `:`:tok:
 (to support ``var v*: T``).
+
+The ``not`` keyword is always a unary operator, ``a not b`` is parsed
+as ``a(not b)``, not as ``(a) not (b)``.
 
 
 Other tokens
@@ -1224,6 +1232,37 @@ so that the builtin ``echo`` proc does what is expected:
 
   echo @[1, 2, 3]
   # prints "@[1, 2, 3]" and not "123"
+
+
+Unchecked arrays
+----------------
+The ``UncheckedArray[T]`` type is a special kind of ``array`` where its bounds
+are not checked. This is often useful to implement customized flexibly sized
+arrays. Additionally an unchecked array is translated into a C array of
+undetermined size:
+
+.. code-block:: nim
+  type
+    MySeq = object
+      len, cap: int
+      data: UncheckedArray[int]
+
+Produces roughly this C code:
+
+.. code-block:: C
+  typedef struct {
+    NI len;
+    NI cap;
+    NI data[];
+  } MySeq;
+
+The base type of the unchecked array may not contain any GC'ed memory but this
+is currently not checked.
+
+**Future directions**: GC'ed memory should be allowed in unchecked arrays and
+there should be an explicit annotation of how the GC is to determine the
+runtime size of the array.
+
 
 
 Tuples and object types
@@ -2344,7 +2383,8 @@ Automatic self insertions
 Starting with version 0.14 of the language, Nim supports ``field`` as a
 shortcut for ``self.field`` comparable to the `this`:idx: keyword in Java
 or C++. This feature has to be explicitly enabled via a ``{.this: self.}``
-statement pragma. This pragma is active for the rest of the module:
+statement pragma (instead of ``self`` any other identifier can be used too).
+This pragma is active for the rest of the module:
 
 .. code-block:: nim
   type
@@ -2358,10 +2398,6 @@ statement pragma. This pragma is active for the rest of the module:
     result = parentField + childField
     # is rewritten to:
     # result = self.parentField + self.childField
-
-Instead of ``self`` any other identifier can be used too, but
-``{.this: self.}`` will become the default directive for the whole language
-eventually.
 
 In addition to fields, routine applications are also rewritten, but only
 if no other interpretation of the call is possible:
@@ -3037,7 +3073,7 @@ The `case expression` is again very similar to the case statement:
 
 As seen in the above example, the case expression can also introduce side
 effects. When multiple statements are given for a branch, Nim will use
-the last expression as the result value, much like in an `expr` template.
+the last expression as the result value.
 
 Table constructor
 -----------------
@@ -4611,8 +4647,8 @@ The concept types can be parametric just like the regular generic types:
     M.data[m * M.N + n] = v
 
   # Adapt the Matrix type to the concept's requirements
-  template Rows*(M: type Matrix): expr = M.M
-  template Cols*(M: type Matrix): expr = M.N
+  template Rows*(M: type Matrix): int = M.M
+  template Cols*(M: type Matrix): int = M.N
   template ValueType*(M: type Matrix): type = M.T
 
   -------------
@@ -5036,9 +5072,8 @@ an ``immediate`` pragma and then these templates do not take part in
 overloading resolution and the parameters' types are *ignored* by the
 compiler. Explicit immediate templates are now deprecated.
 
-**Note**: For historical reasons ``stmt`` is an alias for ``typed`` and
-``expr`` an alias for ``untyped``, but new code should use the newer,
-clearer names.
+**Note**: For historical reasons ``stmt`` was an alias for ``typed`` and
+``expr`` was an alias for ``untyped``, but they are removed.
 
 
 Passing a code block to a template
@@ -5128,9 +5163,6 @@ also ``varargs[untyped]`` so that not even the number of parameters is fixed:
 
 However, since a template cannot iterate over varargs, this feature is
 generally much more useful for macros.
-
-**Note**: For historical reasons ``varargs[expr]`` is not equivalent
-to ``varargs[untyped]``.
 
 
 Symbol binding in templates
@@ -5965,6 +5997,12 @@ curlies is the pattern to match against. The operators ``*``,  ``**``,
 notation, so to match verbatim against ``*`` the ordinary function call syntax
 needs to be used.
 
+Term rewriting macro are applied recursively, up to a limit. This means that
+if the result of a term rewriting macro is eligible for another rewriting,
+the compiler will try to perform it, and so on, until no more optimizations
+are applicable. To avoid putting the compiler into an infinite loop, there is
+a hard limit on how many times a single term rewriting macro can be applied.
+Once this limit has been passed, the term rewriting macro will be ignored.
 
 Unfortunately optimizations are hard to get right and even the tiny example
 is **wrong**:
@@ -6717,6 +6755,16 @@ routines marked as ``noSideEffect``.
   func `+` (x, y: int): int
 
 
+To override the compiler's side effect analysis a ``{.noSideEffect.}``
+pragma block can be used:
+
+.. code-block:: nim
+
+  func f() =
+    {.noSideEffect.}:
+      echo "test"
+
+
 compileTime pragma
 ------------------
 The ``compileTime`` pragma is used to mark a proc or variable to be used at
@@ -7317,6 +7365,17 @@ Example:
 
   embedsC()
 
+``nimbase.h`` defines ``NIM_EXTERNC`` C macro that can be used for
+``extern "C"`` code to work with both ``nim c`` and ``nim cpp``, eg:
+
+.. code-block:: Nim
+  proc foobar() {.importc:"$1".}
+  {.emit: """
+  #include <stdio.h>
+  NIM_EXTERNC
+  void fun(){}
+  """.}
+
 For backwards compatibility, if the argument to the ``emit`` statement
 is a single string literal, Nim symbols can be referred to via backticks.
 This usage is however deprecated.
@@ -7344,7 +7403,7 @@ prefixes ``/*TYPESECTION*/`` or ``/*VARSECTION*/`` or ``/*INCLUDESECTION*/``:
 ImportCpp pragma
 ----------------
 
-**Note**: `c2nim <c2nim.html>`_ can parse a large subset of C++ and knows
+**Note**: `c2nim <https://nim-lang.org/docs/c2nim.html>`_ can parse a large subset of C++ and knows
 about the ``importcpp`` pragma pattern language. It is not necessary
 to know all the details described here.
 
@@ -7890,36 +7949,6 @@ defined, and it should not be used with GC'ed memory (ref's).
 **Future directions**: Using GC'ed memory in packed pragma will result in
 compile-time error. Usage with inheritance should be defined and documented.
 
-Unchecked pragma
-----------------
-The ``unchecked`` pragma can be used to mark a named array as ``unchecked``
-meaning its bounds are not checked. This is often useful to
-implement customized flexibly sized arrays. Additionally an unchecked array is
-translated into a C array of undetermined size:
-
-.. code-block:: nim
-  type
-    ArrayPart{.unchecked.} = array[0, int]
-    MySeq = object
-      len, cap: int
-      data: ArrayPart
-
-Produces roughly this C code:
-
-.. code-block:: C
-  typedef struct {
-    NI len;
-    NI cap;
-    NI data[];
-  } MySeq;
-
-The base type of the unchecked array may not contain any GC'ed memory but this
-is currently not checked.
-
-**Future directions**: GC'ed memory should be allowed in unchecked arrays and
-there should be an explicit annotation of how the GC is to determine the
-runtime size of the array.
-
 
 Dynlib pragma for import
 ------------------------
@@ -8003,7 +8032,7 @@ To enable thread support the ``--threads:on`` command line switch needs to
 be used. The ``system`` module then contains several threading primitives.
 See the `threads <threads.html>`_ and `channels <channels.html>`_ modules
 for the low level thread API. There are also high level parallelism constructs
-available. See `spawn <#parallel-spawn>`_ for further details.
+available. See `spawn <#parallel-amp-spawn>`_ for further details.
 
 Nim's memory model for threads is quite different than that of other common
 programming languages (C, Pascal, Java): Each thread has its own (garbage

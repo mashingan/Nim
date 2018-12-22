@@ -96,6 +96,12 @@ proc setupVM*(module: PSym; cache: IdentCache; scriptName: string;
   cbconf fileExists:
     setResult(a, os.fileExists(a.getString 0))
 
+  cbconf projectName:
+    setResult(a, conf.projectName)
+  cbconf projectDir:
+    setResult(a, conf.projectPath.string)
+  cbconf projectPath:
+    setResult(a, conf.projectFull.string)
   cbconf thisDir:
     setResult(a, vthisDir)
   cbconf put:
@@ -117,6 +123,7 @@ proc setupVM*(module: PSym; cache: IdentCache; scriptName: string;
   cbconf setCommand:
     conf.command = a.getString 0
     let arg = a.getString 1
+    incl(conf.globalOptions, optWasNimscript)
     if arg.len > 0:
       conf.projectName = arg
       let path =
@@ -152,6 +159,8 @@ proc setupVM*(module: PSym; cache: IdentCache; scriptName: string;
 proc runNimScript*(cache: IdentCache; scriptName: AbsoluteFile;
                    freshDefines=true; conf: ConfigRef) =
   rawMessage(conf, hintConf, scriptName.string)
+  let oldSymbolFiles = conf.symbolFiles
+  conf.symbolFiles = disabledSf
 
   let graph = newModuleGraph(cache, conf)
   connectCallbacks(graph)
@@ -159,11 +168,8 @@ proc runNimScript*(cache: IdentCache; scriptName: AbsoluteFile;
 
   defineSymbol(conf.symbols, "nimscript")
   defineSymbol(conf.symbols, "nimconfig")
-  var registeredPasses {.global.} = false
-  if not registeredPasses:
-    registerPass(graph, semPass)
-    registerPass(graph, evalPass)
-    registeredPasses = true
+  registerPass(graph, semPass)
+  registerPass(graph, evalPass)
 
   conf.searchPaths.add(conf.libpath)
 
@@ -180,3 +186,4 @@ proc runNimScript*(cache: IdentCache; scriptName: AbsoluteFile;
   #initDefines()
   undefSymbol(conf.symbols, "nimscript")
   undefSymbol(conf.symbols, "nimconfig")
+  conf.symbolFiles = oldSymbolFiles

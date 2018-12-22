@@ -41,7 +41,7 @@ type
     hintLineTooLong, hintXDeclaredButNotUsed, hintConvToBaseNotNeeded,
     hintConvFromXtoItselfNotNeeded, hintExprAlwaysX, hintQuitCalled,
     hintProcessing, hintCodeBegin, hintCodeEnd, hintConf, hintPath,
-    hintConditionAlwaysTrue, hintName, hintPattern,
+    hintConditionAlwaysTrue, hintConditionAlwaysFalse, hintName, hintPattern,
     hintExecuting, hintLinking, hintDependency,
     hintSource, hintPerformance, hintStackTrace, hintGCStats,
     hintGlobalVar,
@@ -107,6 +107,7 @@ const
     hintConf: "used config file '$1'",
     hintPath: "added path: '$1'",
     hintConditionAlwaysTrue: "condition is always true: '$1'",
+    hintConditionAlwaysFalse: "condition is always false: '$1'",
     hintName: "name should be: '$1'",
     hintPattern: "$1",
     hintExecuting: "$1",
@@ -140,7 +141,7 @@ const
     "Success", "SuccessX", "CC", "LineTooLong",
     "XDeclaredButNotUsed", "ConvToBaseNotNeeded", "ConvFromXtoItselfNotNeeded",
     "ExprAlwaysX", "QuitCalled", "Processing", "CodeBegin", "CodeEnd", "Conf",
-    "Path", "CondTrue", "Name", "Pattern", "Exec", "Link", "Dependency",
+    "Path", "CondTrue", "CondFalse", "Name", "Pattern", "Exec", "Link", "Dependency",
     "Source", "Performance", "StackTrace", "GCStats", "GlobalVar",
     "User", "UserRaw", "ExtendedContext",
   ]
@@ -248,7 +249,7 @@ type
                             ## some close token.
 
     errorOutputs*: TErrorOutputs
-    msgContext*: seq[TLineInfo]
+    msgContext*: seq[tuple[info: TLineInfo, detail: string]]
     lastError*: TLineInfo
     filenameToIndexTbl*: Table[string, FileIndex]
     fileInfos*: seq[TFileInfo]

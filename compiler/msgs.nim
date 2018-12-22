@@ -139,8 +139,8 @@ const
 proc getInfoContextLen*(conf: ConfigRef): int = return conf.m.msgContext.len
 proc setInfoContextLen*(conf: ConfigRef; L: int) = setLen(conf.m.msgContext, L)
 
-proc pushInfoContext*(conf: ConfigRef; info: TLineInfo) =
-  conf.m.msgContext.add(info)
+proc pushInfoContext*(conf: ConfigRef; info: TLineInfo; detail: string = "") =
+  conf.m.msgContext.add((info, detail))
 
 proc popInfoContext*(conf: ConfigRef) =
   setLen(conf.m.msgContext, len(conf.m.msgContext) - 1)
@@ -149,7 +149,7 @@ proc getInfoContext*(conf: ConfigRef; index: int): TLineInfo =
   let L = conf.m.msgContext.len
   let i = if index < 0: L + index else: index
   if i >=% L: result = unknownLineInfo()
-  else: result = conf.m.msgContext[i]
+  else: result = conf.m.msgContext[i].info
 
 template toFilename*(conf: ConfigRef; fileIdx: FileIndex): string =
   if fileIdx.int32 < 0 or conf == nil:
@@ -190,10 +190,13 @@ template toFullPath*(conf: ConfigRef; info: TLineInfo): string =
 proc toMsgFilename*(conf: ConfigRef; info: TLineInfo): string =
   if info.fileIndex.int32 < 0:
     result = "???"
-  elif optListFullPaths in conf.globalOptions:
-    result = conf.m.fileInfos[info.fileIndex.int32].fullPath.string
+    return
+  let absPath = conf.m.fileInfos[info.fileIndex.int32].fullPath.string
+  let relPath = conf.m.fileInfos[info.fileIndex.int32].projPath.string
+  if optListFullPaths in conf.globalOptions:
+    result = absPath
   else:
-    result = conf.m.fileInfos[info.fileIndex.int32].projPath.string
+    result = if absPath.len < relPath.len: absPath else: relPath
 
 proc toLinenumber*(info: TLineInfo): int {.inline.} =
   result = int info.line
@@ -340,20 +343,26 @@ proc exactEquals*(a, b: TLineInfo): bool =
 
 proc writeContext(conf: ConfigRef; lastinfo: TLineInfo) =
   const instantiationFrom = "template/generic instantiation from here"
+  const instantiationOfFrom = "template/generic instantiation of `$1` from here"
   var info = lastinfo
   for i in 0 ..< len(conf.m.msgContext):
-    if conf.m.msgContext[i] != lastinfo and conf.m.msgContext[i] != info:
+    let context = conf.m.msgContext[i]
+    if context.info != lastinfo and context.info != info:
       if conf.structuredErrorHook != nil:
-        conf.structuredErrorHook(conf, conf.m.msgContext[i], instantiationFrom,
-                                  Severity.Error)
+        conf.structuredErrorHook(conf, context.info, instantiationFrom,
+                                 Severity.Error)
       else:
+        let message = if context.detail == "":
+          instantiationFrom
+        else:
+          instantiationOfFrom.format(context.detail)
         styledMsgWriteln(styleBright,
-                         PosFormat % [toMsgFilename(conf, conf.m.msgContext[i]),
-                                      coordToStr(conf.m.msgContext[i].line.int),
-                                      coordToStr(conf.m.msgContext[i].col+1)],
+                         PosFormat % [toMsgFilename(conf, context.info),
+                                      coordToStr(context.info.line.int),
+                                      coordToStr(context.info.col+1)],
                          resetStyle,
-                         instantiationFrom)
-    info = conf.m.msgContext[i]
+                         message)
+    info = context.info
 
 proc ignoreMsgBecauseOfIdeTools(conf: ConfigRef; msg: TMsgKind): bool =
   msg >= errGenerated and conf.cmd == cmdIdeTools and optIdeDebug notin conf.globalOptions

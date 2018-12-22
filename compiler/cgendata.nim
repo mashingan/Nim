@@ -13,7 +13,7 @@ import
   ast, astalgo, ropes, passes, options, intsets, platform, sighashes,
   tables, ndi, lineinfos, pathutils
 
-from modulegraphs import ModuleGraph
+from modulegraphs import ModuleGraph, PPassContext
 
 type
   TLabel* = Rope              # for the C generator a label is just a rope
@@ -112,7 +112,7 @@ type
     mainModProcs*, mainModInit*, otherModsInit*, mainDatInit*: Rope
     mapping*: Rope             # the generated mapping file (if requested)
     modules*: seq[BModule]     # list of all compiled modules
-    forwardedProcsCounter*: int
+    forwardedProcs*: seq[PSym] # proc:s that did not yet have a body
     generatedHeader*: BModule
     breakPointId*: int
     breakpoints*: Rope # later the breakpoints are inserted into the main proc
@@ -132,7 +132,7 @@ type
                             # nimtvDeps is VERY hard to cache because it's
                             # not a list of IDs nor can it be made to be one.
 
-  TCGen = object of TPassContext # represents a C source file
+  TCGen = object of PPassContext # represents a C source file
     s*: TCFileSections        # sections of the C file
     flags*: set[Codegenflag]
     module*: PSym
@@ -150,7 +150,6 @@ type
     preInitProc*: BProc       # code executed before the init proc
     typeStack*: TTypeSeq      # used for type generation
     dataCache*: TNodeTable
-    forwardedProcs*: TSymSeq  # keep forwarded procs here
     typeNodes*, nimTypes*: int # used for type info generation
     typeNodesName*, nimTypesName*: Rope # used for type info generation
     labels*: Natural          # for generating unique module-scope names
@@ -188,12 +187,12 @@ proc newProc*(prc: PSym, module: BModule): BProc =
   result.sigConflicts = initCountTable[string]()
 
 proc newModuleList*(g: ModuleGraph): BModuleList =
-  BModuleList(modules: @[], typeInfoMarker: initTable[SigHash, Rope](), config: g.config,
-    graph: g, nimtvDeps: @[], nimtvDeclared: initIntSet())
+  BModuleList(typeInfoMarker: initTable[SigHash, Rope](), config: g.config,
+    graph: g, nimtvDeclared: initIntSet())
 
 iterator cgenModules*(g: BModuleList): BModule =
-  for i in 0..high(g.modules):
+  for m in g.modules:
     # ultimately, we are iterating over the file ids here.
     # some "files" won't have an associated cgen module (like stdin)
     # and we must skip over them.
-    if g.modules[i] != nil: yield g.modules[i]
+    if m != nil: yield m
