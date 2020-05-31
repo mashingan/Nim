@@ -11,7 +11,8 @@
 import
   ast, astalgo, modules, passes, condsyms,
   options, sem, semdata, llstream, vm, vmdef,
-  modulegraphs, idents, os, pathutils
+  modulegraphs, idents, os, pathutils, passaux,
+  scriptconfig
 
 type
   Interpreter* = ref object ## Use Nim as an interpreter with this object
@@ -45,7 +46,7 @@ proc selectUniqueSymbol*(i: Interpreter; name: string;
     s = nextIdentIter(it, i.mainModule.tab)
 
 proc selectRoutine*(i: Interpreter; name: string): PSym =
-  ## Selects a declared rountine (proc/func/etc) from the main module.
+  ## Selects a declared routine (proc/func/etc) from the main module.
   ## The routine needs to have the export marker ``*``. The only matching
   ## routine is returned and ``nil`` if it is overloaded.
   result = selectUniqueSymbol(i, name, {skTemplate, skMacro, skFunc,
@@ -80,6 +81,9 @@ proc findNimStdLib*(): string =
   ## Returns "" on failure.
   try:
     let nimexe = os.findExe("nim")
+      # this can't work with choosenim shims, refs https://github.com/dom96/choosenim/issues/189
+      # it'd need `nim dump --dump.format:json . | jq -r .libpath`
+      # which we should simplify as `nim dump --key:libpath`
     if nimexe.len == 0: return ""
     result = nimexe.splitPath()[0] /../ "lib"
     if not fileExists(result / "system.nim"):
@@ -92,20 +96,22 @@ proc findNimStdLib*(): string =
 proc findNimStdLibCompileTime*(): string =
   ## Same as ``findNimStdLib`` but uses source files used at compile time,
   ## and asserts on error.
-  const sourcePath = currentSourcePath()
-  result = sourcePath.parentDir.parentDir / "lib"
+  const exe = getCurrentCompilerExe()
+  result = exe.splitFile.dir.parentDir / "lib"
   doAssert fileExists(result / "system.nim"), "result:" & result
 
 proc createInterpreter*(scriptName: string;
                         searchPaths: openArray[string];
-                        flags: TSandboxFlags = {}): Interpreter =
+                        flags: TSandboxFlags = {},
+                        defines = @[("nimscript", "true")],
+                        registerOps = true): Interpreter =
   var conf = newConfigRef()
   var cache = newIdentCache()
   var graph = newModuleGraph(cache, conf)
   connectCallbacks(graph)
   initDefines(conf.symbols)
-  defineSymbol(conf.symbols, "nimscript")
-  defineSymbol(conf.symbols, "nimconfig")
+  for define in defines:
+    defineSymbol(conf.symbols, define[0], define[1])
   registerPass(graph, semPass)
   registerPass(graph, evalPass)
 
@@ -118,6 +124,8 @@ proc createInterpreter*(scriptName: string;
   var vm = newCtx(m, cache, graph)
   vm.mode = emRepl
   vm.features = flags
+  if registerOps:
+    vm.registerAdditionalOps() # Required to register parts of stdlib modules
   graph.vm = vm
   graph.compileSystemModule()
   result = Interpreter(mainModule: m, graph: graph, scriptName: scriptName)
@@ -125,3 +133,29 @@ proc createInterpreter*(scriptName: string;
 proc destroyInterpreter*(i: Interpreter) =
   ## destructor.
   discard "currently nothing to do."
+
+proc runRepl*(r: TLLRepl;
+              searchPaths: openArray[string];
+              supportNimscript: bool) =
+  var conf = newConfigRef()
+  var cache = newIdentCache()
+  var graph = newModuleGraph(cache, conf)
+
+  for p in searchPaths:
+    conf.searchPaths.add(AbsoluteDir p)
+    if conf.libpath.isEmpty: conf.libpath = AbsoluteDir p
+
+  conf.cmd = cmdInteractive
+  conf.errorMax = high(int)
+  initDefines(conf.symbols)
+  defineSymbol(conf.symbols, "nimscript")
+  if supportNimscript: defineSymbol(conf.symbols, "nimconfig")
+  when hasFFI: defineSymbol(graph.config.symbols, "nimffi")
+  registerPass(graph, verbosePass)
+  registerPass(graph, semPass)
+  registerPass(graph, evalPass)
+  var m = graph.makeStdinModule()
+  incl(m.flags, sfMainModule)
+  if supportNimscript: graph.vm = setupVM(m, cache, "stdin", graph)
+  graph.compileSystemModule()
+  processModule(graph, m, llStreamOpenStdIn(r))

@@ -10,6 +10,8 @@
 ## This module implements a `reStructuredText`:idx: parser. A large
 ## subset is implemented. Some features of the `markdown`:idx: wiki syntax are
 ## also supported.
+##
+## **Note:** Import ``packages/docutils/rst`` to use this module
 
 import
   os, strutils, rstast
@@ -43,8 +45,8 @@ type
     mwUnsupportedField
 
   MsgHandler* = proc (filename: string, line, col: int, msgKind: MsgKind,
-                       arg: string) {.closure.} ## what to do in case of an error
-  FindFileHandler* = proc (filename: string): string {.closure.}
+                       arg: string) {.closure, gcsafe.} ## what to do in case of an error
+  FindFileHandler* = proc (filename: string): string {.closure, gcsafe.}
 
 const
   messages: array[MsgKind, string] = [
@@ -113,8 +115,8 @@ const
 type
   TokType = enum
     tkEof, tkIndent, tkWhite, tkWord, tkAdornment, tkPunct, tkOther
-  Token = object             # a RST token
-    kind*: TokType           # the type of the token
+  Token = object              # a RST token
+    kind*: TokType            # the type of the token
     ival*: int                # the indentation or parsed integer value
     symbol*: string           # the parsed symbol as string
     line*, col*: int          # line and column of the token
@@ -151,20 +153,27 @@ proc getAdornment(L: var Lexer, tok: var Token) =
   inc(L.col, pos - L.bufpos)
   L.bufpos = pos
 
+proc getBracket(L: var Lexer, tok: var Token) =
+  tok.kind = tkPunct
+  tok.line = L.line
+  tok.col = L.col
+  add(tok.symbol, L.buf[L.bufpos])
+  inc L.col
+  inc L.bufpos
+
 proc getIndentAux(L: var Lexer, start: int): int =
   var pos = start
-  var buf = L.buf
   # skip the newline (but include it in the token!)
-  if buf[pos] == '\x0D':
-    if buf[pos + 1] == '\x0A': inc(pos, 2)
+  if L.buf[pos] == '\x0D':
+    if L.buf[pos + 1] == '\x0A': inc(pos, 2)
     else: inc(pos)
-  elif buf[pos] == '\x0A':
+  elif L.buf[pos] == '\x0A':
     inc(pos)
   if L.skipPounds:
-    if buf[pos] == '#': inc(pos)
-    if buf[pos] == '#': inc(pos)
+    if L.buf[pos] == '#': inc(pos)
+    if L.buf[pos] == '#': inc(pos)
   while true:
-    case buf[pos]
+    case L.buf[pos]
     of ' ', '\x0B', '\x0C':
       inc(pos)
       inc(result)
@@ -173,9 +182,9 @@ proc getIndentAux(L: var Lexer, start: int): int =
       result = result - (result mod 8) + 8
     else:
       break                   # EndOfFile also leaves the loop
-  if buf[pos] == '\0':
+  if L.buf[pos] == '\0':
     result = 0
-  elif (buf[pos] == '\x0A') or (buf[pos] == '\x0D'):
+  elif (L.buf[pos] == '\x0A') or (L.buf[pos] == '\x0D'):
     # look at the next line for proper indentation:
     result = getIndentAux(L, pos)
   L.bufpos = pos              # no need to set back buf
@@ -204,11 +213,13 @@ proc rawGetTok(L: var Lexer, tok: var Token) =
       rawGetTok(L, tok)       # ignore spaces before \n
   of '\x0D', '\x0A':
     getIndent(L, tok)
-  of '!', '\"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.',
-     '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{',
-     '|', '}', '~':
+  of '!', '\"', '#', '$', '%', '&', '\'',  '*', '+', ',', '-', '.',
+     '/', ':', ';', '<', '=', '>', '?', '@', '\\', '^', '_', '`',
+     '|', '~':
     getAdornment(L, tok)
     if len(tok.symbol) <= 3: tok.kind = tkPunct
+  of '(', ')', '[', ']', '{', '}':
+    getBracket(L, tok)
   else:
     tok.line = L.line
     tok.col = L.col
@@ -294,14 +305,14 @@ proc whichMsgClass*(k: MsgKind): MsgClass =
   else: assert false, "msgkind does not fit naming scheme"
 
 proc defaultMsgHandler*(filename: string, line, col: int, msgkind: MsgKind,
-                        arg: string) {.procvar.} =
+                        arg: string) =
   let mc = msgkind.whichMsgClass
   let a = messages[msgkind] % arg
   let message = "$1($2, $3) $4: $5" % [filename, $line, $col, $mc, a]
   if mc == mcError: raise newException(EParseError, message)
   else: writeLine(stdout, message)
 
-proc defaultFindFile*(filename: string): string {.procvar.} =
+proc defaultFindFile*(filename: string): string =
   if existsFile(filename): result = filename
   else: result = ""
 
@@ -560,9 +571,9 @@ proc match(p: RstParser, start: int, expr: string): bool =
       result = (p.tok[j].kind == tkWord) or (p.tok[j].symbol == "#")
       if result:
         case p.tok[j].symbol[0]
-        of 'a'..'z', 'A'..'Z': result = len(p.tok[j].symbol) == 1
+        of 'a'..'z', 'A'..'Z', '#': result = len(p.tok[j].symbol) == 1
         of '0'..'9': result = allCharsInSet(p.tok[j].symbol, {'0'..'9'})
-        else: discard
+        else: result = false
     else:
       var c = expr[i]
       var length = 0
@@ -777,8 +788,33 @@ proc parseMarkdownCodeblock(p: var RstParser): PRstNode =
   add(lb, n)
   result = newRstNode(rnCodeBlock)
   add(result, args)
-  add(result, nil)
+  add(result, PRstNode(nil))
   add(result, lb)
+
+proc parseMarkdownLink(p: var RstParser; father: PRstNode): bool =
+  result = true
+  var desc, link = ""
+  var i = p.idx
+
+  template parse(endToken, dest) =
+    inc i # skip begin token
+    while true:
+      if p.tok[i].kind in {tkEof, tkIndent}: return false
+      if p.tok[i].symbol == endToken: break
+      dest.add p.tok[i].symbol
+      inc i
+    inc i # skip end token
+
+  parse("]", desc)
+  if p.tok[i].symbol != "(": return false
+  parse(")", link)
+  let child = newRstNode(rnHyperlink)
+  child.add desc
+  child.add link
+  # only commit if we detected no syntax error:
+  father.add child
+  p.idx = i
+  result = true
 
 proc parseInline(p: var RstParser, father: PRstNode) =
   case p.tok[p.idx].kind
@@ -811,6 +847,10 @@ proc parseInline(p: var RstParser, father: PRstNode) =
       var n = newRstNode(rnSubstitutionReferences)
       parseUntil(p, n, "|", false)
       add(father, n)
+    elif roSupportMarkdown in p.s.options and
+        p.tok[p.idx].symbol == "[" and p.tok[p.idx+1].symbol != "[" and
+        parseMarkdownLink(p, father):
+      discard "parseMarkdownLink already processed it"
     else:
       if roSupportSmilies in p.s.options:
         let n = parseSmiley(p)
@@ -1037,15 +1077,32 @@ proc isOptionList(p: RstParser): bool =
   result = match(p, p.idx, "-w") or match(p, p.idx, "--w") or
            match(p, p.idx, "/w") or match(p, p.idx, "//w")
 
+proc isMarkdownHeadlinePattern(s: string): bool =
+  if s.len >= 1 and s.len <= 6:
+    for c in s:
+      if c != '#': return false
+    result = true
+
+proc isMarkdownHeadline(p: RstParser): bool =
+  if roSupportMarkdown in p.s.options:
+    if isMarkdownHeadlinePattern(p.tok[p.idx].symbol) and p.tok[p.idx+1].kind == tkWhite:
+      if p.tok[p.idx+2].kind in {tkWord, tkOther, tkPunct}:
+        result = true
+
 proc whichSection(p: RstParser): RstNodeKind =
   case p.tok[p.idx].kind
   of tkAdornment:
     if match(p, p.idx + 1, "ii"): result = rnTransition
     elif match(p, p.idx + 1, " a"): result = rnTable
     elif match(p, p.idx + 1, "i"): result = rnOverline
-    else: result = rnLeaf
+    elif isMarkdownHeadline(p):
+      result = rnHeadline
+    else:
+      result = rnLeaf
   of tkPunct:
-    if match(p, tokenAfterNewline(p), "ai"):
+    if isMarkdownHeadline(p):
+      result = rnHeadline
+    elif match(p, tokenAfterNewline(p), "ai"):
       result = rnHeadline
     elif p.tok[p.idx].symbol == "::":
       result = rnLiteralBlock
@@ -1060,7 +1117,7 @@ proc whichSection(p: RstParser): RstNodeKind =
     elif match(p, p.idx, ":w:") and predNL(p):
       # (p.tok[p.idx].symbol == ":")
       result = rnFieldList
-    elif match(p, p.idx, "(e) "):
+    elif match(p, p.idx, "(e) ") or match(p, p.idx, "e. "):
       result = rnEnumList
     elif match(p, p.idx, "+a+"):
       result = rnGridTable
@@ -1130,12 +1187,18 @@ proc parseParagraph(p: var RstParser, result: PRstNode) =
 
 proc parseHeadline(p: var RstParser): PRstNode =
   result = newRstNode(rnHeadline)
-  parseUntilNewline(p, result)
-  assert(p.tok[p.idx].kind == tkIndent)
-  assert(p.tok[p.idx + 1].kind == tkAdornment)
-  var c = p.tok[p.idx + 1].symbol[0]
-  inc(p.idx, 2)
-  result.level = getLevel(p.s.underlineToLevel, p.s.uLevel, c)
+  if isMarkdownHeadline(p):
+    result.level = p.tok[p.idx].symbol.len
+    assert(p.tok[p.idx+1].kind == tkWhite)
+    inc p.idx, 2
+    parseUntilNewline(p, result)
+  else:
+    parseUntilNewline(p, result)
+    assert(p.tok[p.idx].kind == tkIndent)
+    assert(p.tok[p.idx + 1].kind == tkAdornment)
+    var c = p.tok[p.idx + 1].symbol[0]
+    inc(p.idx, 2)
+    result.level = getLevel(p.s.underlineToLevel, p.s.uLevel, c)
 
 type
   IntSeq = seq[int]
@@ -1486,7 +1549,7 @@ proc parseDirective(p: var RstParser, flags: DirFlags,
     popInd(p)
     add(result, content)
   else:
-    add(result, nil)
+    add(result, PRstNode(nil))
 
 proc parseDirBody(p: var RstParser, contentParser: SectionParser): PRstNode =
   if indFollows(p):
@@ -1495,15 +1558,20 @@ proc parseDirBody(p: var RstParser, contentParser: SectionParser): PRstNode =
     popInd(p)
 
 proc dirInclude(p: var RstParser): PRstNode =
-  #
-  #The following options are recognized:
-  #
-  #start-after : text to find in the external data file
-  #    Only the content after the first occurrence of the specified text will
-  #    be included.
-  #end-before : text to find in the external data file
-  #    Only the content before the first occurrence of the specified text
-  #    (but after any after text) will be included.
+  ##
+  ## The following options are recognized:
+  ##
+  ## :start-after: text to find in the external data file
+  ##
+  ##     Only the content after the first occurrence of the specified
+  ##     text will be included. If text is not found inclusion will
+  ##     start from beginning of the file
+  ##
+  ## :end-before: text to find in the external data file
+  ##
+  ##     Only the content before the first occurrence of the specified
+  ##     text (but after any after text) will be included. If text is
+  ##     not found inclusion will happen until the end of the file.
   #literal : flag (empty)
   #    The entire included text is inserted into the document as a single
   #    literal block (useful for program listings).
@@ -1523,10 +1591,34 @@ proc dirInclude(p: var RstParser): PRstNode =
       result = newRstNode(rnLiteralBlock)
       add(result, newRstNode(rnLeaf, readFile(path)))
     else:
+      let inputString = readFile(path).string()
+      let startPosition =
+        block:
+          let searchFor = n.getFieldValue("start-after").strip()
+          if searchFor != "":
+            let pos = inputString.find(searchFor)
+            if pos != -1: pos + searchFor.len()
+            else: 0
+          else:
+            0
+
+      let endPosition =
+        block:
+          let searchFor = n.getFieldValue("end-before").strip()
+          if searchFor != "":
+            let pos = inputString.find(searchFor, start = startPosition)
+            if pos != -1: pos - 1
+            else: 0
+          else:
+            inputString.len - 1
+
       var q: RstParser
       initParser(q, p.s)
       q.filename = path
-      q.col += getTokens(readFile(path), false, q.tok)
+      q.col += getTokens(
+        inputString[startPosition..endPosition].strip(),
+        false,
+        q.tok)
       # workaround a GCC bug; more like the interior pointer bug?
       #if find(q.tok[high(q.tok)].symbol, "\0\x01\x02") > 0:
       #  InternalError("Too many binary zeros in include file")
@@ -1542,7 +1634,7 @@ proc dirCodeBlock(p: var RstParser, nimExtension = false): PRstNode =
   ## <http://docutils.sourceforge.net/docs/ref/rst/directives.html#code>`_ and
   ## the nim extension ``.. code-block::``. If the block is an extension, we
   ## want the default language syntax highlighting to be Nim, so we create a
-  ## fake internal field to comminicate with the generator. The field is named
+  ## fake internal field to communicate with the generator. The field is named
   ## ``default-language``, which is unlikely to collide with a field specified
   ## by any random rst input file.
   ##

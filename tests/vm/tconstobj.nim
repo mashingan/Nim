@@ -48,3 +48,25 @@ let people = {
 }.toTable()
 
 echo people["001"]
+
+# Object downconversion should not copy
+
+type
+  SomeBaseObj  {.inheritable.} = object of RootObj
+    txt : string
+  InheritedFromBase = object of SomeBaseObj
+    other : string
+
+proc initBase(sbo: var SomeBaseObj) =
+  sbo.txt = "Initialized string from base"
+
+static:
+  var ifb2: InheritedFromBase
+  initBase(SomeBaseObj(ifb2))
+  echo repr(ifb2)
+  doAssert(ifb2.txt == "Initialized string from base")
+
+static: # issue #11861
+  var ifb2: InheritedFromBase
+  initBase(ifb2)
+  doAssert(ifb2.txt == "Initialized string from base")

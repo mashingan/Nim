@@ -102,7 +102,7 @@ type
 
 # - Tparam_kind procs
 
-proc `$`*(value: Tparam_kind): string {.procvar.} =
+proc `$`*(value: Tparam_kind): string =
   ## Stringifies the type, used to generate help texts.
   case value:
   of PK_EMPTY: result = ""
@@ -137,7 +137,7 @@ proc new_parameter_specification*(consumes = PK_EMPTY,
 
 # - Tparsed_parameter procs
 
-proc `$`*(data: Tparsed_parameter): string {.procvar.} =
+proc `$`*(data: Tparsed_parameter): string =
   ## Stringifies the value, mostly for debug purposes.
   ##
   ## The proc will display the value followed by non string type in brackets.
@@ -251,8 +251,8 @@ proc parse_parameter(quit_on_failure: bool, param, value: string,
   case param_kind:
   of PK_INT:
     try: result.int_val = value.parseInt
-    except OverflowError:
-      raise_or_quit(OverflowError, ("parameter $1 requires an " &
+    except OverflowDefect:
+      raise_or_quit(OverflowDefect, ("parameter $1 requires an " &
         "integer, but $2 is too large to fit into one") % [param,
         escape(value)])
     except ValueError:
@@ -471,7 +471,7 @@ proc build_help*(expected: seq[Tparameter_specification] = @[],
   let width = prefixes.map(proc (x: string): int = 3 + len(x)).max
 
   for line in zip(prefixes, helps):
-    result.add(line.a & spaces(width - line.a.len) & line.b)
+    result.add(line[0] & spaces(width - line[0].len) & line[1])
 
 
 proc echo_help*(expected: seq[Tparameter_specification] = @[],

@@ -14,7 +14,7 @@
 ## `db_mysql <db_mysql.html>`_.
 ##
 ## Parameter substitution
-## ----------------------
+## ======================
 ##
 ## All ``db_*`` modules support the same form of parameter substitution.
 ## That is, using the ``?`` (question mark) to signify the place where a
@@ -38,10 +38,10 @@
 ##           3)
 ##
 ## Examples
-## --------
+## ========
 ##
 ## Opening a connection to a database
-## ==================================
+## ----------------------------------
 ##
 ## .. code-block:: Nim
 ##     import db_postgres
@@ -49,7 +49,7 @@
 ##     db.close()
 ##
 ## Creating a table
-## ================
+## ----------------
 ##
 ## .. code-block:: Nim
 ##      db.exec(sql"DROP TABLE IF EXISTS myTable")
@@ -58,7 +58,7 @@
 ##                       name varchar(50) not null)"""))
 ##
 ## Inserting data
-## ==============
+## --------------
 ##
 ## .. code-block:: Nim
 ##     db.exec(sql"INSERT INTO myTable (id, name) VALUES (0, ?)",
@@ -67,6 +67,8 @@ import strutils, postgres
 
 import db_common
 export db_common
+
+import std/private/since
 
 type
   DbConn* = PPGconn    ## encapsulates a database connection
@@ -182,7 +184,7 @@ proc setRow(res: PPGresult, r: var Row, line, cols: int32) =
 iterator fastRows*(db: DbConn, query: SqlQuery,
                    args: varargs[string, `$`]): Row {.tags: [ReadDbEffect].} =
   ## executes the query and iterates over the result dataset. This is very
-  ## fast, but potenially dangerous: If the for-loop-body executes another
+  ## fast, but potentially dangerous: If the for-loop-body executes another
   ## query, the results can be undefined. For Postgres it is safe though.
   var res = setupQuery(db, query, args)
   var L = pqnfields(res)
@@ -381,6 +383,10 @@ proc `[]`*(row: InstantRow; col: int): string {.inline.} =
   ## returns text for given column of the row
   $pqgetvalue(row.res, int32(row.line), int32(col))
 
+proc unsafeColumnAt*(row: InstantRow, index: int): cstring {.inline.} =
+  ## Return cstring of given column of the row
+  pqgetvalue(row.res, int32(row.line), int32(index))
+
 proc len*(row: InstantRow): int {.inline.} =
   ## returns number of columns in the row
   int(pqNfields(row.res))
@@ -392,7 +398,8 @@ proc getRow*(db: DbConn, query: SqlQuery,
   var res = setupQuery(db, query, args)
   var L = pqnfields(res)
   result = newRow(L)
-  setRow(res, result, 0, L)
+  if pqntuples(res) > 0:
+    setRow(res, result, 0, L)
   pqclear(res)
 
 proc getRow*(db: DbConn, stmtName: SqlPrepared,
@@ -400,7 +407,8 @@ proc getRow*(db: DbConn, stmtName: SqlPrepared,
   var res = setupQuery(db, stmtName, args)
   var L = pqNfields(res)
   result = newRow(L)
-  setRow(res, result, 0, L)
+  if pqntuples(res) > 0:
+    setRow(res, result, 0, L)
   pqClear(res)
 
 proc getAllRows*(db: DbConn, query: SqlQuery,
@@ -435,8 +443,12 @@ proc getValue*(db: DbConn, query: SqlQuery,
   ## executes the query and returns the first column of the first row of the
   ## result dataset. Returns "" if the dataset contains no rows or the database
   ## value is NULL.
-  var x = pqgetvalue(setupQuery(db, query, args), 0, 0)
-  result = if isNil(x): "" else: $x
+  var res = setupQuery(db, query, args)
+  if pqntuples(res) > 0:
+    var x = pqgetvalue(res, 0, 0)
+    result = if isNil(x): "" else: $x
+  else:
+    result = ""
 
 proc getValue*(db: DbConn, stmtName: SqlPrepared,
                args: varargs[string, `$`]): string {.
@@ -444,8 +456,12 @@ proc getValue*(db: DbConn, stmtName: SqlPrepared,
   ## executes the query and returns the first column of the first row of the
   ## result dataset. Returns "" if the dataset contains no rows or the database
   ## value is NULL.
-  var x = pqgetvalue(setupQuery(db, stmtName, args), 0, 0)
-  result = if isNil(x): "" else: $x
+  var res = setupQuery(db, stmtName, args)
+  if pqntuples(res) > 0:
+    var x = pqgetvalue(res, 0, 0)
+    result = if isNil(x): "" else: $x
+  else:
+    result = ""
 
 proc tryInsertID*(db: DbConn, query: SqlQuery,
                   args: varargs[string, `$`]): int64 {.
@@ -468,6 +484,26 @@ proc insertID*(db: DbConn, query: SqlQuery,
   ## generated ID for the row. For Postgre this adds
   ## ``RETURNING id`` to the query, so it only works if your primary key is
   ## named ``id``.
+  result = tryInsertID(db, query, args)
+  if result < 0: dbError(db)
+
+proc tryInsert*(db: DbConn, query: SqlQuery,pkName: string,
+                args: varargs[string, `$`]): int64
+               {.tags: [WriteDbEffect], since: (1, 3).}=
+  ## executes the query (typically "INSERT") and returns the
+  ## generated ID for the row or -1 in case of an error. 
+  var x = pqgetvalue(setupQuery(db, SqlQuery(string(query) & " RETURNING " & pkName),
+    args), 0, 0)
+  if not isNil(x):
+    result = parseBiggestInt($x)
+  else:
+    result = -1
+
+proc insert*(db: DbConn, query: SqlQuery, pkName: string,
+             args: varargs[string, `$`]): int64
+            {.tags: [WriteDbEffect], since: (1, 3).} =
+  ## executes the query (typically "INSERT") and returns the
+  ## generated ID 
   result = tryInsertID(db, query, args)
   if result < 0: dbError(db)
 

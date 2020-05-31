@@ -1,10 +1,13 @@
-# <img src="https://raw.githubusercontent.com/nim-lang/assets/master/Art/logo-crown.png" height="28px"/> Nim [![Build Status][badge-nim-travisci]][nim-travisci]
+# <img src="https://raw.githubusercontent.com/nim-lang/assets/master/Art/logo-crown.png" height="28px"/> Nim
+
+[![Build Status](https://dev.azure.com/nim-lang/Nim/_apis/build/status/nim-lang.Nim?branchName=devel)](https://dev.azure.com/nim-lang/Nim/_build/latest?definitionId=1&branchName=devel)
 
 This repository contains the Nim compiler, Nim's stdlib, tools and documentation.
 For more information about Nim, including downloads and documentation for
 the latest release, check out [Nim's website][nim-site] or [bleeding edge docs](https://nim-lang.github.io/Nim/).
 
 ## Community
+
 [![Join the IRC chat][badge-nim-irc]][nim-irc]
 [![Join the Gitter chat][badge-nim-gitter]][nim-gitter]
 [![Get help][badge-nim-forum-gethelp]][nim-forum]
@@ -23,6 +26,7 @@ the latest release, check out [Nim's website][nim-site] or [bleeding edge docs](
 * [Github Wiki][nim-wiki] - Misc user-contributed content.
 
 ## Compiling
+
 The compiler currently officially supports the following platform and
 architecture combinations:
 
@@ -37,7 +41,7 @@ Compiling the Nim compiler is quite straightforward if you follow these steps:
 
 First, the C source of an older version of the Nim compiler is needed to
 bootstrap the latest version because the Nim compiler itself is written in the
-Nim programming language. Those C sources are available within the 
+Nim programming language. Those C sources are available within the
 [``nim-lang/csources``][csources-repo] repository.
 
 Next, to build from source you will need:
@@ -47,7 +51,7 @@ Next, to build from source you will need:
     later.
   * Either ``git`` or ``wget`` to download the needed source repositories.
   * The ``build-essential`` package when using ``gcc`` on Ubuntu (and likely
-    other distros as well). 
+    other distros as well).
 
 Then, if you are on a \*nix system or Windows, the following steps should compile
 Nim from source using ``gcc``, ``git`` and the ``koch`` build tool.
@@ -56,40 +60,36 @@ Nim from source using ``gcc``, ``git`` and the ``koch`` build tool.
 For most users, installing the latest stable version is enough. Check out
 the installation instructions on the website to do so: https://nim-lang.org/install.html.
 
+For package maintainers: see [packaging guidelines](https://nim-lang.github.io/Nim/packaging.html).
+
+
+First get Nim from github:
+
 ```
-# step 1:
 git clone https://github.com/nim-lang/Nim.git
 cd Nim
-
-# step 2 (posix) clones `csources.git`, bootstraps Nim compiler and compiles tools
-sh build_all.sh
-
-# step 2 (windows)
-git clone --depth 1 https://github.com/nim-lang/csources.git
-
-cd csources
-# requires `gcc` in your PATH, see also https://nim-lang.org/install_windows.html
-build.bat # x86 Windows
-build64.bat # x86_64 Windows
-cd ..
-
-bin\nim c koch
-koch boot -d:release
-koch tools # Compile Nimble and other tools
-# end of step 2 (windows)
 ```
+
+Next run the appropriate build shell script for your platform:
+
+* `build_all.sh` (Linux, Mac)
+* `build_all.bat` (Windows)
+
 
 Finally, once you have finished the build steps (on Windows, Mac or Linux) you
 should add the ``bin`` directory to your PATH.
 
+See also [rebuilding the compiler](intern.html#rebuilding-the-compiler).
+
 ## Koch
+
 ``koch`` is the build tool used to build various parts of Nim and to generate
 documentation and the website, among other things. The ``koch`` tool can also
-be used to run the Nim test suite. 
+be used to run the Nim test suite.
 
 Assuming that you added Nim's ``bin`` directory to your PATH, you may execute
 the tests using ``./koch tests``. The tests take a while to run, but you
-can run a subset of tests by specifying a category (for example 
+can run a subset of tests by specifying a category (for example
 ``./koch tests cat async``).
 
 For more information on the ``koch`` build tool please see the documentation
@@ -106,6 +106,7 @@ This project exists thanks to all the people who contribute.
 <a href="https://github.com/nim-lang/Nim/graphs/contributors"><img src="https://opencollective.com/Nim/contributors.svg?width=890" /></a>
 
 ## Contributing
+
 [![Backers on Open Collective](https://opencollective.com/nim/backers/badge.svg)](#backers) [![Sponsors on Open Collective](https://opencollective.com/nim/sponsors/badge.svg)](#sponsors)
 [![Setup a bounty via Bountysource][badge-nim-bountysource]][nim-bountysource]
 [![Donate Bitcoins][badge-nim-bitcoin]][nim-bitcoin]
@@ -120,7 +121,7 @@ you should familiarize yourself with the following repository structure:
 * ``bin/``, ``build/`` - these directories are empty, but are used when Nim is built.
 * ``compiler/`` - the compiler source code. Also includes nimfix, and plugins within
   ``compiler/nimfix`` and ``compiler/plugins`` respectively.
-* ``nimsuggest`` - the nimsuggest tool that previously lived in the [``nim-lang/nimsuggest``][nimsuggest-repo] repository. 
+* ``nimsuggest`` - the nimsuggest tool that previously lived in the [``nim-lang/nimsuggest``][nimsuggest-repo] repository.
 * ``config/`` - the configuration for the compiler and documentation generator.
 * ``doc/`` - the documentation files in reStructuredText format.
 * ``lib/`` - the standard library, including:
@@ -191,17 +192,16 @@ Nim. You are explicitly permitted to develop commercial applications using Nim.
 
 Please read the [copying.txt](copying.txt) file for more details.
 
-Copyright © 2006-2018 Andreas Rumpf, all rights reserved.
+Copyright © 2006-2020 Andreas Rumpf, all rights reserved.
 
 [nim-site]: https://nim-lang.org
 [nim-forum]: https://forum.nim-lang.org
 [nim-issues]: https://github.com/nim-lang/Nim/issues
 [nim-issues-easy]: https://github.com/nim-lang/Nim/labels/Easy
 [nim-irc]: https://webchat.freenode.net/?channels=nim
-[nim-travisci]: https://travis-ci.org/nim-lang/Nim
 [nim-twitter]: https://twitter.com/nim_lang
-[nim-stackoverflow]: https://stackoverflow.com/questions/tagged/nim
-[nim-stackoverflow-newest]: https://stackoverflow.com/questions/tagged/nim?sort=newest&pageSize=15
+[nim-stackoverflow]: https://stackoverflow.com/questions/tagged/nim-lang
+[nim-stackoverflow-newest]: https://stackoverflow.com/questions/tagged/nim-lang?sort=newest&pageSize=15
 [nim-gitter]: https://gitter.im/nim-lang/Nim
 [nim-telegram]: https://t.me/nim_lang
 [nim-bountysource]: https://www.bountysource.com/teams/nim

@@ -50,14 +50,13 @@ test "unittest multiple requires":
 import math, random
 from strutils import parseInt
 proc defectiveRobot() =
-  randomize()
   case random(1..4)
   of 1: raise newException(OSError, "CANNOT COMPUTE!")
   of 2: discard parseInt("Hello World!")
   of 3: raise newException(IOError, "I can't do that Dave.")
   else: assert 2 + 2 == 5
 test "unittest expect":
-  expect IOError, OSError, ValueError, AssertionError:
+  expect IOError, OSError, ValueError, AssertionDefect:
     defectiveRobot()
 
 var

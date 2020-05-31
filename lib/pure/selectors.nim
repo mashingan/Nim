@@ -27,14 +27,14 @@
 ##
 ## TODO: ``/dev/poll``, ``event ports`` and filesystem events.
 
-import os, strutils, nativesockets
+import os, nativesockets
 
 const hasThreadSupport = compileOption("threads") and defined(threadsafe)
 
 const ioselSupportedPlatform* = defined(macosx) or defined(freebsd) or
                                 defined(netbsd) or defined(openbsd) or
                                 defined(dragonfly) or
-                                (defined(linux) and not defined(android))
+                                (defined(linux) and not defined(android) and not defined(emscripten))
   ## This constant is used to determine whether the destination platform is
   ## fully supported by ``ioselectors`` module.
 
@@ -186,7 +186,7 @@ when defined(nimdoc):
   proc setData*[T](s: Selector[T], fd: SocketHandle|int, data: var T): bool =
     ## Associate application-defined ``data`` with descriptor ``fd``.
     ##
-    ## Returns ``true``, if data was succesfully updated, ``false`` otherwise.
+    ## Returns ``true``, if data was successfully updated, ``false`` otherwise.
 
   template isEmpty*[T](s: Selector[T]): bool = # TODO: Why is this a template?
     ## Returns ``true``, if there are no registered events or descriptors
@@ -230,6 +230,7 @@ when defined(nimdoc):
     ## For *poll* and *select* selectors ``-1`` is returned.
 
 else:
+  import strutils
   when hasThreadSupport:
     import locks
 
@@ -238,6 +239,9 @@ else:
 
     proc allocSharedArray[T](nsize: int): ptr SharedArray[T] =
       result = cast[ptr SharedArray[T]](allocShared0(sizeof(T) * nsize))
+
+    proc reallocSharedArray[T](sa: ptr SharedArray[T], nsize: int): ptr SharedArray[T] =
+      result = cast[ptr SharedArray[T]](reallocShared(sa, sizeof(T) * nsize))
 
     proc deallocSharedArray[T](sa: ptr SharedArray[T]) =
       deallocShared(cast[pointer](sa))
@@ -248,7 +252,7 @@ else:
       VnodeRename, VnodeRevoke
 
   type
-    IOSelectorsException* = object of Exception
+    IOSelectorsException* = object of CatchableError
 
     ReadyKey* = object
       fd* : int
@@ -311,7 +315,12 @@ else:
     key.events = {}
     key.data = empty
 
-  when defined(linux):
+  proc verifySelectParams(timeout: int) =
+    # Timeout of -1 means: wait forever
+    # Anything higher is the time to wait in milliseconds.
+    doAssert(timeout >= -1, "Cannot select with a negative value, got " & $timeout)
+
+  when defined(linux) and not defined(emscripten):
     include ioselects/ioselectors_epoll
   elif bsdPlatform:
     include ioselects/ioselectors_kqueue

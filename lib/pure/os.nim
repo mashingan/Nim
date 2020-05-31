@@ -10,16 +10,58 @@
 ## This module contains basic operating system facilities like
 ## retrieving environment variables, reading command line arguments,
 ## working with directories, running shell commands, etc.
-{.deadCodeElim: on.}  # dce option deprecated
+##
+## .. code-block::
+##   import os
+##
+##   let myFile = "/path/to/my/file.nim"
+##
+##   let pathSplit = splitPath(myFile)
+##   assert pathSplit.head == "/path/to/my"
+##   assert pathSplit.tail == "file.nim"
+##
+##   assert parentDir(myFile) == "/path/to/my"
+##
+##   let fileSplit = splitFile(myFile)
+##   assert fileSplit.dir == "/path/to/my"
+##   assert fileSplit.name == "file"
+##   assert fileSplit.ext == ".nim"
+##
+##   assert myFile.changeFileExt("c") == "/path/to/my/file.c"
 
-{.push debugger: off.}
+##
+##
+## **See also:**
+## * `osproc module <osproc.html>`_ for process communication beyond
+##   `execShellCmd proc <#execShellCmd,string>`_
+## * `parseopt module <parseopt.html>`_ for command-line parser beyond
+##   `parseCmdLine proc <#parseCmdLine,string>`_
+## * `uri module <uri.html>`_
+## * `distros module <distros.html>`_
+## * `dynlib module <dynlib.html>`_
+## * `streams module <streams.html>`_
 
 include "system/inclrtl"
+import std/private/since
 
 import
   strutils, pathnorm
 
 const weirdTarget = defined(nimscript) or defined(js)
+
+since (1, 1):
+  const
+    invalidFilenameChars* = {'/', '\\', ':', '*', '?', '"', '<', '>', '|', '^', '\0'} ## \
+    ## Characters that may produce invalid filenames across Linux, Windows, Mac, etc.
+    ## You can check if your filename contains these char and strip them for safety.
+    ## Mac bans ``':'``, Linux bans ``'/'``, Windows bans all others.
+    invalidFilenames* = [
+      "CON", "PRN", "AUX", "NUL",
+      "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+      "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"] ## \
+    ## Filenames that may be invalid across Linux, Windows, Mac, etc.
+    ## You can check if your filename match these and rename it for safety
+    ## (Currently all invalid filenames are from Windows only).
 
 when weirdTarget:
   discard
@@ -38,31 +80,38 @@ when weirdTarget and defined(nimErrorProcCanHaveBody):
 else:
   {.pragma: noNimScript.}
 
-type
-  ReadEnvEffect* = object of ReadIOEffect   ## effect that denotes a read
-                                            ## from an environment variable
-  WriteEnvEffect* = object of WriteIOEffect ## effect that denotes a write
-                                            ## to an environment variable
+proc normalizePathAux(path: var string){.inline, raises: [], noSideEffect.}
 
-  ReadDirEffect* = object of ReadIOEffect   ## effect that denotes a read
+type
+  ReadEnvEffect* = object of ReadIOEffect   ## Effect that denotes a read
+                                            ## from an environment variable.
+  WriteEnvEffect* = object of WriteIOEffect ## Effect that denotes a write
+                                            ## to an environment variable.
+
+  ReadDirEffect* = object of ReadIOEffect   ## Effect that denotes a read
                                             ## operation from the directory
-                                            ## structure
-  WriteDirEffect* = object of WriteIOEffect ## effect that denotes a write
+                                            ## structure.
+  WriteDirEffect* = object of WriteIOEffect ## Effect that denotes a write
                                             ## operation to
-                                            ## the directory structure
+                                            ## the directory structure.
 
   OSErrorCode* = distinct int32 ## Specifies an OS Error Code.
 
 include "includes/osseps"
 
+proc absolutePathInternal(path: string): string {.gcsafe.}
+
 proc normalizePathEnd(path: var string, trailingSep = false) =
-  ## ensures ``path`` has exactly 0 or 1 trailing `DirSep`, depending on
+  ## Ensures ``path`` has exactly 0 or 1 trailing `DirSep`, depending on
   ## ``trailingSep``, and taking care of edge cases: it preservers whether
   ## a path is absolute or relative, and makes sure trailing sep is `DirSep`,
-  ## not `AltSep`.
+  ## not `AltSep`. Trailing `/.` are compressed, see examples.
   if path.len == 0: return
   var i = path.len
-  while i >= 1 and path[i-1] in {DirSep, AltSep}: dec(i)
+  while i >= 1:
+    if path[i-1] in {DirSep, AltSep}: dec(i)
+    elif path[i-1] == '.' and i >= 2 and path[i-2] in {DirSep, AltSep}: dec(i)
+    else: break
   if trailingSep:
     # foo// => foo
     path.setLen(i)
@@ -76,41 +125,59 @@ proc normalizePathEnd(path: var string, trailingSep = false) =
     path = $DirSep
 
 proc normalizePathEnd(path: string, trailingSep = false): string =
+  ## outplace overload
+  runnableExamples:
+    when defined(posix):
+      assert normalizePathEnd("/lib//.//", trailingSep = true) == "/lib/"
+      assert normalizePathEnd("lib/./.", trailingSep = false) == "lib"
+      assert normalizePathEnd(".//./.", trailingSep = false) == "."
+      assert normalizePathEnd("", trailingSep = true) == "" # not / !
+      assert normalizePathEnd("/", trailingSep = false) == "/" # not "" !
   result = path
   result.normalizePathEnd(trailingSep)
+
+since((1, 1)):
+  export normalizePathEnd
+
+template endsWith(a: string, b: set[char]): bool =
+  a.len > 0 and a[^1] in b
+
+proc joinPathImpl(result: var string, state: var int, tail: string) =
+  let trailingSep = tail.endsWith({DirSep, AltSep}) or tail.len == 0 and result.endsWith({DirSep, AltSep})
+  normalizePathEnd(result, trailingSep=false)
+  addNormalizePath(tail, result, state, DirSep)
+  normalizePathEnd(result, trailingSep=trailingSep)
 
 proc joinPath*(head, tail: string): string {.
   noSideEffect, rtl, extern: "nos$1".} =
   ## Joins two directory names to one.
   ##
-  ## For example on Unix:
+  ## returns normalized path concatenation of `head` and `tail`, preserving
+  ## whether or not `tail` has a trailing slash (or, if tail if empty, whether
+  ## head has one).
   ##
-  ## .. code-block:: nim
-  ##   joinPath("usr", "lib")
-  ##
-  ## results in:
-  ##
-  ## .. code-block:: nim
-  ##   "usr/lib"
-  ##
-  ## If head is the empty string, tail is returned. If tail is the empty
-  ## string, head is returned with a trailing path separator. If tail starts
-  ## with a path separator it will be removed when concatenated to head. Other
-  ## path separators not located on boundaries won't be modified. More
-  ## examples on Unix:
-  ##
-  ## .. code-block:: nim
-  ##   assert joinPath("usr", "") == "usr/"
-  ##   assert joinPath("", "lib") == "lib"
-  ##   assert joinPath("", "/lib") == "/lib"
-  ##   assert joinPath("usr/", "/lib") == "usr/lib"
+  ## See also:
+  ## * `joinPath(varargs) proc <#joinPath,varargs[string]>`_
+  ## * `/ proc <#/,string,string>`_
+  ## * `splitPath proc <#splitPath,string>`_
+  ## * `uri.combine proc <uri.html#combine,Uri,Uri>`_
+  ## * `uri./ proc <uri.html#/,Uri,string>`_
+  runnableExamples:
+    when defined(posix):
+      assert joinPath("usr", "lib") == "usr/lib"
+      assert joinPath("usr", "lib/") == "usr/lib/"
+      assert joinPath("usr", "") == "usr"
+      assert joinPath("usr/", "") == "usr/"
+      assert joinPath("", "") == ""
+      assert joinPath("", "lib") == "lib"
+      assert joinPath("", "/lib") == "/lib"
+      assert joinPath("usr/", "/lib") == "usr/lib"
+      assert joinPath("usr/lib", "../bin") == "usr/bin"
+
   result = newStringOfCap(head.len + tail.len)
   var state = 0
-  addNormalizePath(head, result, state, DirSep)
-  if tail.len == 0:
-    result.add DirSep
-  else:
-    addNormalizePath(tail, result, state, DirSep)
+  joinPathImpl(result, state, head)
+  joinPathImpl(result, state, tail)
   when false:
     if len(head) == 0:
       result = tail
@@ -127,75 +194,221 @@ proc joinPath*(head, tail: string): string {.
 
 proc joinPath*(parts: varargs[string]): string {.noSideEffect,
   rtl, extern: "nos$1OpenArray".} =
-  ## The same as `joinPath(head, tail)`, but works with any number of
-  ## directory parts. You need to pass at least one element or the proc
+  ## The same as `joinPath(head, tail) proc <#joinPath,string,string>`_,
+  ## but works with any number of directory parts.
+  ##
+  ## You need to pass at least one element or the proc
   ## will assert in debug builds and crash on release builds.
+  ##
+  ## See also:
+  ## * `joinPath(head, tail) proc <#joinPath,string,string>`_
+  ## * `/ proc <#/,string,string>`_
+  ## * `/../ proc <#/../,string,string>`_
+  ## * `splitPath proc <#splitPath,string>`_
+  runnableExamples:
+    when defined(posix):
+      assert joinPath("a") == "a"
+      assert joinPath("a", "b", "c") == "a/b/c"
+      assert joinPath("usr/lib", "../../var", "log") == "var/log"
+
   var estimatedLen = 0
   for p in parts: estimatedLen += p.len
   result = newStringOfCap(estimatedLen)
   var state = 0
   for i in 0..high(parts):
-    addNormalizePath(parts[i], result, state, DirSep)
+    joinPathImpl(result, state, parts[i])
 
 proc `/`*(head, tail: string): string {.noSideEffect.} =
-  ## The same as ``joinPath(head, tail)``
+  ## The same as `joinPath(head, tail) proc <#joinPath,string,string>`_.
   ##
-  ## Here are some examples for Unix:
-  ##
-  ## .. code-block:: nim
-  ##   assert "usr" / "" == "usr/"
-  ##   assert "" / "lib" == "lib"
-  ##   assert "" / "/lib" == "/lib"
-  ##   assert "usr/" / "/lib" == "usr/lib"
+  ## See also:
+  ## * `/../ proc <#/../,string,string>`_
+  ## * `joinPath(head, tail) proc <#joinPath,string,string>`_
+  ## * `joinPath(varargs) proc <#joinPath,varargs[string]>`_
+  ## * `splitPath proc <#splitPath,string>`_
+  ## * `uri.combine proc <uri.html#combine,Uri,Uri>`_
+  ## * `uri./ proc <uri.html#/,Uri,string>`_
+  runnableExamples:
+    when defined(posix):
+      assert "usr" / "" == "usr"
+      assert "" / "lib" == "lib"
+      assert "" / "/lib" == "/lib"
+      assert "usr/" / "/lib/" == "usr/lib/"
+      assert "usr" / "lib" / "../bin" == "usr/bin"
+
   return joinPath(head, tail)
 
 proc splitPath*(path: string): tuple[head, tail: string] {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Splits a directory into (head, tail), so that
+  ## Splits a directory into `(head, tail)` tuple, so that
   ## ``head / tail == path`` (except for edge cases like "/usr").
   ##
-  ## Examples:
-  ##
-  ## .. code-block:: nim
-  ##   splitPath("usr/local/bin") -> ("usr/local", "bin")
-  ##   splitPath("usr/local/bin/") -> ("usr/local/bin", "")
-  ##   splitPath("bin") -> ("", "bin")
-  ##   splitPath("/bin") -> ("", "bin")
-  ##   splitPath("") -> ("", "")
+  ## See also:
+  ## * `joinPath(head, tail) proc <#joinPath,string,string>`_
+  ## * `joinPath(varargs) proc <#joinPath,varargs[string]>`_
+  ## * `/ proc <#/,string,string>`_
+  ## * `/../ proc <#/../,string,string>`_
+  ## * `relativePath proc <#relativePath,string,string>`_
+  runnableExamples:
+    assert splitPath("usr/local/bin") == ("usr/local", "bin")
+    assert splitPath("usr/local/bin/") == ("usr/local/bin", "")
+    assert splitPath("/bin/") == ("/bin", "")
+    when (NimMajor, NimMinor) <= (1, 0):
+      assert splitPath("/bin") == ("", "bin")
+    else:
+      assert splitPath("/bin") == ("/", "bin")
+    assert splitPath("bin") == ("", "bin")
+    assert splitPath("") == ("", "")
+
   var sepPos = -1
   for i in countdown(len(path)-1, 0):
     if path[i] in {DirSep, AltSep}:
       sepPos = i
       break
   if sepPos >= 0:
-    result.head = substr(path, 0, sepPos-1)
+    result.head = substr(path, 0,
+      when (NimMajor, NimMinor) <= (1, 0):
+        sepPos-1
+      else:
+        if likely(sepPos >= 1): sepPos-1 else: 0
+    )
     result.tail = substr(path, sepPos+1)
   else:
     result.head = ""
     result.tail = path
 
-when FileSystemCaseSensitive:
-  template `!=?`(a, b: char): bool = toLowerAscii(a) != toLowerAscii(b)
-else:
-  template `!=?`(a, b: char): bool = a != b
-
-proc relativePath*(path, base: string; sep = DirSep): string {.
-  noSideEffect, rtl, extern: "nos$1", raises: [].} =
-  ## Converts `path` to a path relative to `base`.
-  ## The `sep` is used for the path normalizations, this can be useful to
-  ## ensure the relative path only contains '/' so that it can be used for
-  ## URL constructions.
+proc isAbsolute*(path: string): bool {.rtl, noSideEffect, extern: "nos$1", raises: [].} =
+  ## Checks whether a given `path` is absolute.
+  ##
+  ## On Windows, network paths are considered absolute too.
   runnableExamples:
-    doAssert relativePath("/Users/me/bar/z.nim", "/Users/other/bad", '/') == "../../me/bar/z.nim"
-    doAssert relativePath("/Users/me/bar/z.nim", "/Users/other", '/') == "../me/bar/z.nim"
-    doAssert relativePath("/Users///me/bar//z.nim", "//Users/", '/') == "me/bar/z.nim"
-    doAssert relativePath("/Users/me/bar/z.nim", "/Users/me", '/') == "bar/z.nim"
-    doAssert relativePath("", "/users/moo", '/') == ""
+    assert not "".isAbsolute
+    assert not ".".isAbsolute
+    when defined(posix):
+      assert "/".isAbsolute
+      assert not "a/".isAbsolute
+      assert "/a/".isAbsolute
 
+  if len(path) == 0: return false
 
-  # Todo: If on Windows, path and base do not agree on the drive letter,
-  # return `path` as is.
+  when doslikeFileSystem:
+    var len = len(path)
+    result = (path[0] in {'/', '\\'}) or
+              (len > 1 and path[0] in {'a'..'z', 'A'..'Z'} and path[1] == ':')
+  elif defined(macos):
+    # according to https://perldoc.perl.org/File/Spec/Mac.html `:a` is a relative path
+    result = path[0] != ':'
+  elif defined(RISCOS):
+    result = path[0] == '$'
+  elif defined(posix) or defined(js):
+    # `or defined(js)` wouldn't be needed pending https://github.com/nim-lang/Nim/issues/13469
+    # This works around the problem for posix, but windows is still broken with nim js -d:nodejs
+    result = path[0] == '/'
+  else:
+    doAssert false # if ever hits here, adapt as needed
+
+when FileSystemCaseSensitive:
+  template `!=?`(a, b: char): bool = a != b
+else:
+  template `!=?`(a, b: char): bool = toLowerAscii(a) != toLowerAscii(b)
+
+when doslikeFileSystem:
+  proc isAbsFromCurrentDrive(path: string): bool {.noSideEffect, raises: []} =
+    ## An absolute path from the root of the current drive (e.g. "\foo")
+    path.len > 0 and
+    (path[0] == AltSep or
+     (path[0] == DirSep and
+      (path.len == 1 or path[1] notin {DirSep, AltSep, ':'})))
+
+  proc isUNCPrefix(path: string): bool {.noSideEffect, raises: []} =
+    path[0] == DirSep and path[1] == DirSep
+
+  proc sameRoot(path1, path2: string): bool {.noSideEffect, raises: []} =
+    ## Return true if path1 and path2 have a same root.
+    ##
+    ## Detail of windows path formats:
+    ## https://docs.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+
+    assert(isAbsolute(path1))
+    assert(isAbsolute(path2))
+
+    let
+      len1 = path1.len
+      len2 = path2.len
+    assert(len1 != 0 and len2 != 0)
+
+    if isAbsFromCurrentDrive(path1) and isAbsFromCurrentDrive(path2):
+      return true
+    elif len1 == 1 or len2 == 1:
+      return false
+    else:
+      if path1[1] == ':' and path2[1] == ':':
+        return path1[0].toLowerAscii() == path2[0].toLowerAscii()
+      else:
+        var
+          p1, p2: PathIter
+          pp1 = next(p1, path1)
+          pp2 = next(p2, path2)
+        if pp1[1] - pp1[0] == 1 and pp2[1] - pp2[0] == 1 and
+           isUNCPrefix(path1) and isUNCPrefix(path2):
+          #UNC
+          var h = 0
+          while p1.hasNext(path1) and p2.hasNext(path2) and h < 2:
+            pp1 = next(p1, path1)
+            pp2 = next(p2, path2)
+            let diff = pp1[1] - pp1[0]
+            if diff != pp2[1] - pp2[0]:
+              return false
+            for i in 0..diff:
+              if path1[i + pp1[0]] !=? path2[i + pp2[0]]:
+                return false
+            inc h
+          return h == 2
+        else:
+          return false
+
+proc relativePath*(path, base: string, sep = DirSep): string {.
+  rtl, extern: "nos$1".} =
+  ## Converts `path` to a path relative to `base`.
+  ##
+  ## The `sep` (default: `DirSep <#DirSep>`_) is used for the path normalizations,
+  ## this can be useful to ensure the relative path only contains `'/'`
+  ## so that it can be used for URL constructions.
+  ##
+  ## On windows, if a root of `path` and a root of `base` are different,
+  ## returns `path` as is because it is impossible to make a relative path.
+  ## That means an absolute path can be returned.
+  ##
+  ## See also:
+  ## * `splitPath proc <#splitPath,string>`_
+  ## * `parentDir proc <#parentDir,string>`_
+  ## * `tailDir proc <#tailDir,string>`_
+  runnableExamples:
+    assert relativePath("/Users/me/bar/z.nim", "/Users/other/bad", '/') == "../../me/bar/z.nim"
+    assert relativePath("/Users/me/bar/z.nim", "/Users/other", '/') == "../me/bar/z.nim"
+    assert relativePath("/Users///me/bar//z.nim", "//Users/", '/') == "me/bar/z.nim"
+    assert relativePath("/Users/me/bar/z.nim", "/Users/me", '/') == "bar/z.nim"
+    assert relativePath("", "/users/moo", '/') == ""
+    assert relativePath("foo", ".", '/') == "foo"
+    assert relativePath("foo", "foo", '/') == "."
+
   if path.len == 0: return ""
+  var base = if base == ".": "" else: base
+  var path = path
+  path.normalizePathAux
+  base.normalizePathAux
+  let a1 = isAbsolute(path)
+  let a2 = isAbsolute(base)
+  if a1 and not a2:
+    base = absolutePathInternal(base)
+  elif a2 and not a1:
+    path = absolutePathInternal(path)
+
+  when doslikeFileSystem:
+    if isAbsolute(path) and isAbsolute(base):
+      if not sameRoot(path, base):
+        return path
+
   var f, b: PathIter
   var ff = (0, -1)
   var bb = (0, -1) # (int, int)
@@ -239,6 +452,21 @@ proc relativePath*(path, base: string; sep = DirSep): string {.
     if not f.hasNext(path): break
     ff = f.next(path)
 
+  when not defined(nimOldRelativePathBehavior):
+    if result.len == 0: result.add "."
+
+proc isRelativeTo*(path: string, base: string): bool {.since: (1, 1).} =
+  ## Returns true if `path` is relative to `base`.
+  runnableExamples:
+    doAssert isRelativeTo("./foo//bar", "foo")
+    doAssert isRelativeTo("foo/bar", ".")
+    doAssert isRelativeTo("/foo/bar.nim", "/foo/bar.nim")
+    doAssert not isRelativeTo("foo/bar.nims", "foo/bar.nim")
+  let path = path.normalizePath
+  let base = base.normalizePath
+  let ret = relativePath(path, base)
+  result = path.len > 0 and not ret.startsWith ".."
+
 proc parentDirPos(path: string): int =
   var q = 1
   if len(path) >= 1 and path[len(path)-1] in {DirSep, AltSep}: q = 2
@@ -250,49 +478,112 @@ proc parentDir*(path: string): string {.
   noSideEffect, rtl, extern: "nos$1".} =
   ## Returns the parent directory of `path`.
   ##
-  ## This is the same as ``splitPath(path).head`` when ``path`` doesn't end
-  ## in a dir separator.
-  ## The remainder can be obtained with ``lastPathPart(path)``
+  ## This is similar to ``splitPath(path).head`` when ``path`` doesn't end
+  ## in a dir separator, but also takes care of path normalizations.
+  ## The remainder can be obtained with `lastPathPart(path) proc
+  ## <#lastPathPart,string>`_.
+  ##
+  ## See also:
+  ## * `relativePath proc <#relativePath,string,string>`_
+  ## * `splitPath proc <#splitPath,string>`_
+  ## * `tailDir proc <#tailDir,string>`_
+  ## * `parentDirs iterator <#parentDirs.i,string>`_
   runnableExamples:
-    doAssert parentDir("") == ""
+    assert parentDir("") == ""
     when defined(posix):
-      doAssert parentDir("/usr/local/bin") == "/usr/local"
-      doAssert parentDir("foo/bar/") == "foo"
-
-  let sepPos = parentDirPos(path)
+      assert parentDir("/usr/local/bin") == "/usr/local"
+      assert parentDir("foo/bar//") == "foo"
+      assert parentDir("//foo//bar//.") == "/foo"
+      assert parentDir("./foo") == "."
+      assert parentDir("/./foo//./") == "/"
+      assert parentDir("a//./") == "."
+      assert parentDir("a/b/c/..") == "a"
+  result = pathnorm.normalizePath(path)
+  var sepPos = parentDirPos(result)
   if sepPos >= 0:
-    result = substr(path, 0, sepPos-1)
-  else:
+    result = substr(result, 0, sepPos)
+    normalizePathEnd(result)
+  elif result == ".." or result == "." or result.len == 0 or result[^1] in {DirSep, AltSep}:
+    # `.` => `..` and .. => `../..`(etc) would be a sensible alternative
+    # `/` => `/` (as done with splitFile) would be a sensible alternative
     result = ""
+  else:
+    result = "."
 
 proc tailDir*(path: string): string {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Returns the tail part of `path`..
+  ## Returns the tail part of `path`.
   ##
-  ## | Example: ``tailDir("/usr/local/bin") == "local/bin"``.
-  ## | Example: ``tailDir("usr/local/bin/") == "local/bin"``.
-  ## | Example: ``tailDir("bin") == ""``.
-  var q = 1
-  if len(path) >= 1 and path[len(path)-1] in {DirSep, AltSep}: q = 2
-  for i in 0..len(path)-q:
+  ## See also:
+  ## * `relativePath proc <#relativePath,string,string>`_
+  ## * `splitPath proc <#splitPath,string>`_
+  ## * `parentDir proc <#parentDir,string>`_
+  runnableExamples:
+    assert tailDir("/bin") == "bin"
+    assert tailDir("bin") == ""
+    assert tailDir("bin/") == ""
+    assert tailDir("/usr/local/bin") == "usr/local/bin"
+    assert tailDir("//usr//local//bin//") == "usr//local//bin//"
+    assert tailDir("./usr/local/bin") == "usr/local/bin"
+    assert tailDir("usr/local/bin") == "local/bin"
+
+  var i = 0
+  while i < len(path):
     if path[i] in {DirSep, AltSep}:
-      return substr(path, i+1)
+      while i < len(path) and path[i] in {DirSep, AltSep}: inc i
+      return substr(path, i)
+    inc i
   result = ""
 
 proc isRootDir*(path: string): bool {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Checks whether a given `path` is a root directory
+  ## Checks whether a given `path` is a root directory.
+  runnableExamples:
+    assert isRootDir("")
+    assert isRootDir(".")
+    assert isRootDir("/")
+    assert isRootDir("a")
+    assert not isRootDir("/a")
+    assert not isRootDir("a/b/c")
+
   result = parentDirPos(path) < 0
 
 iterator parentDirs*(path: string, fromRoot=false, inclusive=true): string =
-  ## Walks over all parent directories of a given `path`
+  ## Walks over all parent directories of a given `path`.
   ##
-  ## If `fromRoot` is set, the traversal will start from the file system root
-  ## diretory. If `inclusive` is set, the original argument will be included
+  ## If `fromRoot` is true (default: false), the traversal will start from
+  ## the file system root directory.
+  ## If `inclusive` is true (default), the original argument will be included
   ## in the traversal.
   ##
-  ## Relative paths won't be expanded by this proc. Instead, it will traverse
+  ## Relative paths won't be expanded by this iterator. Instead, it will traverse
   ## only the directories appearing in the relative path.
+  ##
+  ## See also:
+  ## * `parentDir proc <#parentDir,string>`_
+  ##
+  ## **Examples:**
+  ##
+  ## .. code-block::
+  ##   let g = "a/b/c"
+  ##
+  ##   for p in g.parentDirs:
+  ##     echo p
+  ##   # a/b/c
+  ##   # a/b
+  ##   # a
+  ##
+  ##   for p in g.parentDirs(fromRoot=true):
+  ##     echo p
+  ##   # a/
+  ##   # a/b/
+  ##   # a/b/c
+  ##
+  ##   for p in g.parentDirs(inclusive=false):
+  ##     echo p
+  ##   # a/b
+  ##   # a
+
   if not fromRoot:
     var current = path
     if inclusive: yield path
@@ -310,8 +601,17 @@ iterator parentDirs*(path: string, fromRoot=false, inclusive=true): string =
     if inclusive: yield path
 
 proc `/../`*(head, tail: string): string {.noSideEffect.} =
-  ## The same as ``parentDir(head) / tail`` unless there is no parent
+  ## The same as ``parentDir(head) / tail``, unless there is no parent
   ## directory. Then ``head / tail`` is performed instead.
+  ##
+  ## See also:
+  ## * `/ proc <#/,string,string>`_
+  ## * `parentDir proc <#parentDir,string>`_
+  runnableExamples:
+    when defined(posix):
+      assert "a/b/c" /../ "d/e" == "a/b/d/e"
+      assert "a" /../ "d/e" == "a/d/e"
+
   let sepPos = parentDirPos(head)
   if sepPos >= 0:
     result = substr(head, 0, sepPos-1) / tail
@@ -323,8 +623,21 @@ proc normExt(ext: string): string =
   else: result = ExtSep & ext
 
 proc searchExtPos*(path: string): int =
-  ## Returns index of the '.' char in `path` if it signifies the beginning
+  ## Returns index of the `'.'` char in `path` if it signifies the beginning
   ## of extension. Returns -1 otherwise.
+  ##
+  ## See also:
+  ## * `splitFile proc <#splitFile,string>`_
+  ## * `extractFilename proc <#extractFilename,string>`_
+  ## * `lastPathPart proc <#lastPathPart,string>`_
+  ## * `changeFileExt proc <#changeFileExt,string,string>`_
+  ## * `addFileExt proc <#addFileExt,string,string>`_
+  runnableExamples:
+    assert searchExtPos("a/b/c") == -1
+    assert searchExtPos("c.nim") == 1
+    assert searchExtPos("a/b/c.nim") == 5
+    assert searchExtPos("a.b.c.nim") == 5
+
   # BUGFIX: do not search until 0! .DS_Store is no file extension!
   result = -1
   for i in countdown(len(path)-1, 1):
@@ -336,56 +649,75 @@ proc searchExtPos*(path: string): int =
 
 proc splitFile*(path: string): tuple[dir, name, ext: string] {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Splits a filename into (dir, filename, extension).
-  ## `dir` does not end in `DirSep`.
+  ## Splits a filename into `(dir, name, extension)` tuple.
+  ##
+  ## `dir` does not end in `DirSep <#DirSep>`_ unless it's `/`.
   ## `extension` includes the leading dot.
-  ##
-  ## Example:
-  ##
-  ## .. code-block:: nim
-  ##   var (dir, name, ext) = splitFile("usr/local/nimc.html")
-  ##   assert dir == "usr/local"
-  ##   assert name == "nimc"
-  ##   assert ext == ".html"
   ##
   ## If `path` has no extension, `ext` is the empty string.
   ## If `path` has no directory component, `dir` is the empty string.
   ## If `path` has no filename component, `name` and `ext` are empty strings.
-  if path.len == 0:
-      result = ("", "", "")
-  elif path[^1] in {DirSep, AltSep}:
-    if path.len == 1:
-      # issue #8255
-      result = ($path[0], "", "")
-    else:
-      result = (path[0 ..< ^1], "", "")
-  else:
-    var sepPos = -1
-    var dotPos = path.len
-    for i in countdown(len(path)-1, 0):
-      if path[i] == ExtSep:
-        if dotPos == path.len and i > 0 and
-            path[i-1] notin {DirSep, AltSep, ExtSep}: dotPos = i
-      elif path[i] in {DirSep, AltSep}:
-        sepPos = i
-        break
-    if sepPos-1 >= 0:
-      result.dir = substr(path, 0, sepPos-1)
-    elif path[0] in {DirSep, AltSep}:
-      # issue #8255
-      result.dir = $path[0]
+  ##
+  ## See also:
+  ## * `searchExtPos proc <#searchExtPos,string>`_
+  ## * `extractFilename proc <#extractFilename,string>`_
+  ## * `lastPathPart proc <#lastPathPart,string>`_
+  ## * `changeFileExt proc <#changeFileExt,string,string>`_
+  ## * `addFileExt proc <#addFileExt,string,string>`_
+  runnableExamples:
+    var (dir, name, ext) = splitFile("usr/local/nimc.html")
+    assert dir == "usr/local"
+    assert name == "nimc"
+    assert ext == ".html"
+    (dir, name, ext) = splitFile("/usr/local/os")
+    assert dir == "/usr/local"
+    assert name == "os"
+    assert ext == ""
+    (dir, name, ext) = splitFile("/usr/local/")
+    assert dir == "/usr/local"
+    assert name == ""
+    assert ext == ""
+    (dir, name, ext) = splitFile("/tmp.txt")
+    assert dir == "/"
+    assert name == "tmp"
+    assert ext == ".txt"
 
-    result.name = substr(path, sepPos+1, dotPos-1)
-    result.ext = substr(path, dotPos)
+  var namePos = 0
+  var dotPos = 0
+  for i in countdown(len(path) - 1, 0):
+    if path[i] in {DirSep, AltSep} or i == 0:
+      if path[i] in {DirSep, AltSep}:
+        result.dir = substr(path, 0, if likely(i >= 1): i - 1 else: 0)
+        namePos = i + 1
+      if dotPos > i:
+        result.name = substr(path, namePos, dotPos - 1)
+        result.ext = substr(path, dotPos)
+      else:
+        result.name = substr(path, namePos)
+      break
+    elif path[i] == ExtSep and i > 0 and i < len(path) - 1 and
+         path[i - 1] notin {DirSep, AltSep} and
+         path[i + 1] != ExtSep and dotPos == 0:
+      dotPos = i
 
 proc extractFilename*(path: string): string {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Extracts the filename of a given `path`. This is the same as
-  ## ``name & ext`` from ``splitFile(path)``. See also ``lastPathPart``.
+  ## Extracts the filename of a given `path`.
+  ##
+  ## This is the same as ``name & ext`` from `splitFile(path) proc
+  ## <#splitFile,string>`_.
+  ##
+  ## See also:
+  ## * `searchExtPos proc <#searchExtPos,string>`_
+  ## * `splitFile proc <#splitFile,string>`_
+  ## * `lastPathPart proc <#lastPathPart,string>`_
+  ## * `changeFileExt proc <#changeFileExt,string,string>`_
+  ## * `addFileExt proc <#addFileExt,string,string>`_
   runnableExamples:
-    when defined(posix):
-      doAssert extractFilename("foo/bar/") == ""
-      doAssert extractFilename("foo/bar") == "bar"
+    assert extractFilename("foo/bar/") == ""
+    assert extractFilename("foo/bar") == "bar"
+    assert extractFilename("foo/bar.baz") == "bar.baz"
+
   if path.len == 0 or path[path.len-1] in {DirSep, AltSep}:
     result = ""
   else:
@@ -393,11 +725,19 @@ proc extractFilename*(path: string): string {.
 
 proc lastPathPart*(path: string): string {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## like ``extractFilename``, but ignores trailing dir separator; aka: `baseName`:idx:
-  ## in some other languages.
+  ## Like `extractFilename proc <#extractFilename,string>`_, but ignores
+  ## trailing dir separator; aka: `baseName`:idx: in some other languages.
+  ##
+  ## See also:
+  ## * `searchExtPos proc <#searchExtPos,string>`_
+  ## * `splitFile proc <#splitFile,string>`_
+  ## * `extractFilename proc <#extractFilename,string>`_
+  ## * `changeFileExt proc <#changeFileExt,string,string>`_
+  ## * `addFileExt proc <#addFileExt,string,string>`_
   runnableExamples:
-    when defined(posix):
-      doAssert lastPathPart("foo/bar/") == "bar"
+    assert lastPathPart("foo/bar/") == "bar"
+    assert lastPathPart("foo/bar") == "bar"
+
   let path = path.normalizePathEnd(trailingSep = false)
   result = extractFilename(path)
 
@@ -407,9 +747,22 @@ proc changeFileExt*(filename, ext: string): string {.
   ##
   ## If the `filename` has no extension, `ext` will be added.
   ## If `ext` == "" then any extension is removed.
-  ## `Ext` should be given without the leading '.', because some
+  ##
+  ## `Ext` should be given without the leading `'.'`, because some
   ## filesystems may use a different character. (Although I know
   ## of none such beast.)
+  ##
+  ## See also:
+  ## * `searchExtPos proc <#searchExtPos,string>`_
+  ## * `splitFile proc <#splitFile,string>`_
+  ## * `extractFilename proc <#extractFilename,string>`_
+  ## * `lastPathPart proc <#lastPathPart,string>`_
+  ## * `addFileExt proc <#addFileExt,string,string>`_
+  runnableExamples:
+    assert changeFileExt("foo.bar", "baz") == "foo.baz"
+    assert changeFileExt("foo.bar", "") == "foo"
+    assert changeFileExt("foo", "baz") == "foo.baz"
+
   var extPos = searchExtPos(filename)
   if extPos < 0: result = filename & normExt(ext)
   else: result = substr(filename, 0, extPos-1) & normExt(ext)
@@ -419,9 +772,21 @@ proc addFileExt*(filename, ext: string): string {.
   ## Adds the file extension `ext` to `filename`, unless
   ## `filename` already has an extension.
   ##
-  ## `Ext` should be given without the leading '.', because some
+  ## `Ext` should be given without the leading `'.'`, because some
   ## filesystems may use a different character.
   ## (Although I know of none such beast.)
+  ##
+  ## See also:
+  ## * `searchExtPos proc <#searchExtPos,string>`_
+  ## * `splitFile proc <#splitFile,string>`_
+  ## * `extractFilename proc <#extractFilename,string>`_
+  ## * `lastPathPart proc <#lastPathPart,string>`_
+  ## * `changeFileExt proc <#changeFileExt,string,string>`_
+  runnableExamples:
+    assert addFileExt("foo.bar", "baz") == "foo.bar"
+    assert addFileExt("foo.bar", "") == "foo.bar"
+    assert addFileExt("foo", "baz") == "foo.baz"
+
   var extPos = searchExtPos(filename)
   if extPos < 0: result = filename & normExt(ext)
   else: result = filename
@@ -433,14 +798,14 @@ proc cmpPaths*(pathA, pathB: string): int {.
   ## On a case-sensitive filesystem this is done
   ## case-sensitively otherwise case-insensitively. Returns:
   ##
-  ## | 0 iff pathA == pathB
-  ## | < 0 iff pathA < pathB
-  ## | > 0 iff pathA > pathB
+  ## | 0 if pathA == pathB
+  ## | < 0 if pathA < pathB
+  ## | > 0 if pathA > pathB
   runnableExamples:
     when defined(macosx):
-      doAssert cmpPaths("foo", "Foo") == 0
+      assert cmpPaths("foo", "Foo") == 0
     elif defined(posix):
-      doAssert cmpPaths("foo", "Foo") > 0
+      assert cmpPaths("foo", "Foo") > 0
 
   let a = normalizePath(pathA)
   let b = normalizePath(pathB)
@@ -453,37 +818,12 @@ proc cmpPaths*(pathA, pathB: string): int {.
     else:
       result = cmpIgnoreCase(a, b)
 
-proc isAbsolute*(path: string): bool {.rtl, noSideEffect, extern: "nos$1".} =
-  ## Checks whether a given `path` is absolute.
-  ##
-  ## On Windows, network paths are considered absolute too.
-  runnableExamples:
-    doAssert(not "".isAbsolute)
-    doAssert(not ".".isAbsolute)
-    when defined(posix):
-      doAssert "/".isAbsolute
-      doAssert(not "a/".isAbsolute)
-
-  if len(path) == 0: return false
-
-  when doslikeFileSystem:
-    var len = len(path)
-    result = (path[0] in {'/', '\\'}) or
-              (len > 1 and path[0] in {'a'..'z', 'A'..'Z'} and path[1] == ':')
-  elif defined(macos):
-    # according to https://perldoc.perl.org/File/Spec/Mac.html `:a` is a relative path
-    result = path[0] != ':'
-  elif defined(RISCOS):
-    result = path[0] == '$'
-  elif defined(posix):
-    result = path[0] == '/'
-
 proc unixToNativePath*(path: string, drive=""): string {.
   noSideEffect, rtl, extern: "nos$1".} =
   ## Converts an UNIX-like path to a native one.
   ##
   ## On an UNIX system this does nothing. Else it converts
-  ## '/', '.', '..' to the appropriate things.
+  ## `'/'`, `'.'`, `'..'` to the appropriate things.
   ##
   ## On systems with a concept of "drives", `drive` is used to determine
   ## which drive label to use during absolute path conversion.
@@ -542,8 +882,18 @@ proc getHomeDir*(): string {.rtl, extern: "nos$1",
   tags: [ReadEnvEffect, ReadIOEffect].} =
   ## Returns the home directory of the current user.
   ##
-  ## This proc is wrapped by the expandTilde proc for the convenience of
-  ## processing paths coming from user configuration files.
+  ## This proc is wrapped by the `expandTilde proc <#expandTilde,string>`_
+  ## for the convenience of processing paths coming from user configuration files.
+  ##
+  ## See also:
+  ## * `getConfigDir proc <#getConfigDir>`_
+  ## * `getTempDir proc <#getTempDir>`_
+  ## * `expandTilde proc <#expandTilde,string>`_
+  ## * `getCurrentDir proc <#getCurrentDir>`_
+  ## * `setCurrentDir proc <#setCurrentDir,string>`_
+  runnableExamples:
+    assert getHomeDir() == expandTilde("~")
+
   when defined(windows): return string(getEnv("USERPROFILE")) & "\\"
   else: return string(getEnv("HOME")) & "/"
 
@@ -552,12 +902,19 @@ proc getConfigDir*(): string {.rtl, extern: "nos$1",
   ## Returns the config directory of the current user for applications.
   ##
   ## On non-Windows OSs, this proc conforms to the XDG Base Directory
-  ## spec. Thus, this proc returns the value of the XDG_CONFIG_HOME environment
-  ## variable if it is set, and returns the default configuration directory,
-  ## "~/.config/", otherwise.
+  ## spec. Thus, this proc returns the value of the `XDG_CONFIG_HOME` environment
+  ## variable if it is set, otherwise it returns the default configuration
+  ## directory ("~/.config/").
   ##
   ## An OS-dependent trailing slash is always present at the end of the
-  ## returned string; `\` on Windows and `/` on all other OSs.
+  ## returned string: `\\` on Windows and `/` on all other OSs.
+  ##
+  ## See also:
+  ## * `getHomeDir proc <#getHomeDir>`_
+  ## * `getTempDir proc <#getTempDir>`_
+  ## * `expandTilde proc <#expandTilde,string>`_
+  ## * `getCurrentDir proc <#getCurrentDir>`_
+  ## * `setCurrentDir proc <#setCurrentDir,string>`_
   when defined(windows):
     result = getEnv("APPDATA").string
   else:
@@ -572,23 +929,44 @@ proc getTempDir*(): string {.rtl, extern: "nos$1",
   ## **Please do not use this**: On Android, it currently
   ## returns ``getHomeDir()``, and on other Unix based systems it can cause
   ## security problems too. That said, you can override this implementation
-  ## by adding ``-d:tempDir=mytempname`` to your compiler invokation.
+  ## by adding ``-d:tempDir=mytempname`` to your compiler invocation.
+  ##
+  ## See also:
+  ## * `getHomeDir proc <#getHomeDir>`_
+  ## * `getConfigDir proc <#getConfigDir>`_
+  ## * `expandTilde proc <#expandTilde,string>`_
+  ## * `getCurrentDir proc <#getCurrentDir>`_
+  ## * `setCurrentDir proc <#setCurrentDir,string>`_
+  const tempDirDefault = "/tmp"
+  result = tempDirDefault
   when defined(tempDir):
-    const tempDir {.strdefine.}: string = nil
-    return tempDir
-  elif defined(windows): return string(getEnv("TEMP")) & "\\"
-  elif defined(android): return getHomeDir()
-  else: return "/tmp/"
+    const tempDir {.strdefine.}: string = tempDirDefault
+    result = tempDir
+  elif defined(windows): result = string(getEnv("TEMP"))
+  elif defined(android): result = getHomeDir()
+  else:
+    if existsEnv("TMPDIR"): result = string(getEnv("TMPDIR"))
+  normalizePathEnd(result, trailingSep=true)
 
 proc expandTilde*(path: string): string {.
   tags: [ReadEnvEffect, ReadIOEffect].} =
   ## Expands ``~`` or a path starting with ``~/`` to a full path, replacing
-  ## ``~`` with ``getHomeDir()`` (otherwise returns ``path`` unmodified).
+  ## ``~`` with `getHomeDir() <#getHomeDir>`_ (otherwise returns ``path`` unmodified).
   ##
   ## Windows: this is still supported despite Windows platform not having this
   ## convention; also, both ``~/`` and ``~\`` are handled.
+  ##
+  ## See also:
+  ## * `getHomeDir proc <#getHomeDir>`_
+  ## * `getConfigDir proc <#getConfigDir>`_
+  ## * `getTempDir proc <#getTempDir>`_
+  ## * `getCurrentDir proc <#getCurrentDir>`_
+  ## * `setCurrentDir proc <#setCurrentDir,string>`_
   runnableExamples:
-    doAssert expandTilde("~" / "appname.cfg") == getHomeDir() / "appname.cfg"
+    assert expandTilde("~" / "appname.cfg") == getHomeDir() / "appname.cfg"
+    assert expandTilde("~/foo/bar") == getHomeDir() / "foo/bar"
+    assert expandTilde("/foo/bar") == "/foo/bar"
+
   if len(path) == 0 or path[0] != '~':
     result = path
   elif len(path) == 1:
@@ -602,11 +980,13 @@ proc expandTilde*(path: string): string {.
 # TODO: consider whether quoteShellPosix, quoteShellWindows, quoteShell, quoteShellCommand
 # belong in `strutils` instead; they are not specific to paths
 proc quoteShellWindows*(s: string): string {.noSideEffect, rtl, extern: "nosp$1".} =
-  ## Quote s, so it can be safely passed to Windows API.
-  ## Based on Python's subprocess.list2cmdline
-  ## See http://msdn.microsoft.com/en-us/library/17w5ykft.aspx
-  let needQuote = {' ', '\t'} in s or s.len == 0
+  ## Quote `s`, so it can be safely passed to Windows API.
+  ##
+  ## Based on Python's `subprocess.list2cmdline`.
+  ## See `this link <http://msdn.microsoft.com/en-us/library/17w5ykft.aspx>`_
+  ## for more details.
 
+  let needQuote = {' ', '\t'} in s or s.len == 0
   result = ""
   var backslashBuff = ""
   if needQuote:
@@ -631,7 +1011,7 @@ proc quoteShellWindows*(s: string): string {.noSideEffect, rtl, extern: "nosp$1"
 
 proc quoteShellPosix*(s: string): string {.noSideEffect, rtl, extern: "nosp$1".} =
   ## Quote ``s``, so it can be safely passed to POSIX shell.
-  ## Based on Python's pipes.quote
+  ## Based on Python's `pipes.quote`.
   const safeUnixChars = {'%', '+', '-', '.', '/', '_', ':', '=', '@',
                          '0'..'9', 'A'..'Z', 'a'..'z'}
   if s.len == 0:
@@ -647,18 +1027,23 @@ proc quoteShellPosix*(s: string): string {.noSideEffect, rtl, extern: "nosp$1".}
 when defined(windows) or defined(posix) or defined(nintendoswitch):
   proc quoteShell*(s: string): string {.noSideEffect, rtl, extern: "nosp$1".} =
     ## Quote ``s``, so it can be safely passed to shell.
+    ##
+    ## When on Windows, it calls `quoteShellWindows proc
+    ## <#quoteShellWindows,string>`_. Otherwise, calls `quoteShellPosix proc
+    ## <#quoteShellPosix,string>`_.
     when defined(windows):
       return quoteShellWindows(s)
     else:
       return quoteShellPosix(s)
 
   proc quoteShellCommand*(args: openArray[string]): string =
-    ## Concatenates and quotes shell arguments `args`
+    ## Concatenates and quotes shell arguments `args`.
     runnableExamples:
       when defined(posix):
         assert quoteShellCommand(["aaa", "", "c d"]) == "aaa '' 'c d'"
       when defined(windows):
         assert quoteShellCommand(["aaa", "", "c d"]) == "aaa \"\" \"c d\""
+
     # can't use `map` pending https://github.com/nim-lang/Nim/issues/8303
     for i in 0..<args.len:
       if i > 0: result.add " "
@@ -688,13 +1073,13 @@ when defined(windows) and not weirdTarget:
     template getCommandLine(): untyped = getCommandLineW()
 
     template getFilename(f: untyped): untyped =
-      $cast[WideCString](addr(f.cFilename[0]))
+      $cast[WideCString](addr(f.cFileName[0]))
   else:
     template findFirstFile(a, b: untyped): untyped = findFirstFileA(a, b)
     template findNextFile(a, b: untyped): untyped = findNextFileA(a, b)
     template getCommandLine(): untyped = getCommandLineA()
 
-    template getFilename(f: untyped): untyped = $f.cFilename
+    template getFilename(f: untyped): untyped = $cstring(addr f.cFileName)
 
   proc skipFindData(f: WIN32_FIND_DATA): bool {.inline.} =
     # Note - takes advantage of null delimiter in the cstring
@@ -705,8 +1090,12 @@ when defined(windows) and not weirdTarget:
 proc existsFile*(filename: string): bool {.rtl, extern: "nos$1",
                                           tags: [ReadDirEffect], noNimScript.} =
   ## Returns true if `filename` exists and is a regular file or symlink.
-  ## (directories, device files, named pipes and sockets return false)
-  ## This proc is not available for NimScript.
+  ##
+  ## Directories, device files, named pipes and sockets return false.
+  ##
+  ## See also:
+  ## * `existsDir proc <#existsDir,string>`_
+  ## * `symlinkExists proc <#symlinkExists,string>`_
   when defined(windows):
     when useWinUnicode:
       wrapUnary(a, getFileAttributesW, filename)
@@ -720,8 +1109,12 @@ proc existsFile*(filename: string): bool {.rtl, extern: "nos$1",
 
 proc existsDir*(dir: string): bool {.rtl, extern: "nos$1", tags: [ReadDirEffect],
                                      noNimScript.} =
-  ## Returns true iff the directory `dir` exists. If `dir` is a file, false
+  ## Returns true if the directory `dir` exists. If `dir` is a file, false
   ## is returned. Follows symlinks.
+  ##
+  ## See also:
+  ## * `existsFile proc <#existsFile,string>`_
+  ## * `symlinkExists proc <#symlinkExists,string>`_
   when defined(windows):
     when useWinUnicode:
       wrapUnary(a, getFileAttributesW, dir)
@@ -736,8 +1129,12 @@ proc existsDir*(dir: string): bool {.rtl, extern: "nos$1", tags: [ReadDirEffect]
 proc symlinkExists*(link: string): bool {.rtl, extern: "nos$1",
                                           tags: [ReadDirEffect],
                                           noNimScript.} =
-  ## Returns true iff the symlink `link` exists. Will return true
+  ## Returns true if the symlink `link` exists. Will return true
   ## regardless of whether the link points to a directory or file.
+  ##
+  ## See also:
+  ## * `existsFile proc <#existsFile,string>`_
+  ## * `existsDir proc <#existsDir,string>`_
   when defined(windows):
     when useWinUnicode:
       wrapUnary(a, getFileAttributesW, link)
@@ -750,11 +1147,19 @@ proc symlinkExists*(link: string): bool {.rtl, extern: "nos$1",
     return lstat(link, res) >= 0'i32 and S_ISLNK(res.st_mode)
 
 proc fileExists*(filename: string): bool {.inline, noNimScript.} =
-  ## Synonym for existsFile
+  ## Alias for `existsFile proc <#existsFile,string>`_.
+  ##
+  ## See also:
+  ## * `existsDir proc <#existsDir,string>`_
+  ## * `symlinkExists proc <#symlinkExists,string>`_
   existsFile(filename)
 
 proc dirExists*(dir: string): bool {.inline, noNimScript.} =
-  ## Synonym for existsDir
+  ## Alias for `existsDir proc <#existsDir,string>`_.
+  ##
+  ## See also:
+  ## * `existsFile proc <#existsFile,string>`_
+  ## * `symlinkExists proc <#symlinkExists,string>`_
   existsDir(dir)
 
 when not defined(windows) and not weirdTarget:
@@ -764,19 +1169,23 @@ when not defined(windows) and not weirdTarget:
     else: result = S_ISLNK(rawInfo.st_mode)
 
 const
-  ExeExts* = when defined(windows): ["exe", "cmd", "bat"] else: [""] ## \
-    ## platform specific file extension for executables. On Windows
-    ## ``["exe", "cmd", "bat"]``, on Posix ``[""]``.
+  ExeExts* = ## Platform specific file extension for executables.
+    ## On Windows ``["exe", "cmd", "bat"]``, on Posix ``[""]``.
+    when defined(windows): ["exe", "cmd", "bat"] else: [""]
 
 proc findExe*(exe: string, followSymlinks: bool = true;
-              extensions: openarray[string]=ExeExts): string {.
+              extensions: openArray[string]=ExeExts): string {.
   tags: [ReadDirEffect, ReadEnvEffect, ReadIOEffect], noNimScript.} =
   ## Searches for `exe` in the current working directory and then
   ## in directories listed in the ``PATH`` environment variable.
-  ## Returns "" if the `exe` cannot be found. `exe`
+  ##
+  ## Returns `""` if the `exe` cannot be found. `exe`
   ## is added the `ExeExts <#ExeExts>`_ file extensions if it has none.
+  ##
   ## If the system supports symlinks it also resolves them until it
-  ## meets the actual file. This behavior can be disabled if desired.
+  ## meets the actual file. This behavior can be disabled if desired
+  ## by setting `followSymlinks = false`.
+
   if exe.len == 0: return
   template checkCurrentDir() =
     for ext in extensions:
@@ -804,7 +1213,7 @@ proc findExe*(exe: string, followSymlinks: bool = true;
               var r = newString(256)
               var len = readlink(x, r, 256)
               if len < 0:
-                raiseOSError(osLastError())
+                raiseOSError(osLastError(), exe)
               if len > 256:
                 r = newString(len+1)
                 len = readlink(x, r, len)
@@ -824,27 +1233,37 @@ when weirdTarget:
 
 proc getLastModificationTime*(file: string): times.Time {.rtl, extern: "nos$1", noNimScript.} =
   ## Returns the `file`'s last modification time.
+  ##
+  ## See also:
+  ## * `getLastAccessTime proc <#getLastAccessTime,string>`_
+  ## * `getCreationTime proc <#getCreationTime,string>`_
+  ## * `fileNewer proc <#fileNewer,string,string>`_
   when defined(posix):
     var res: Stat
-    if stat(file, res) < 0'i32: raiseOSError(osLastError())
+    if stat(file, res) < 0'i32: raiseOSError(osLastError(), file)
     result = res.st_mtim.toTime
   else:
     var f: WIN32_FIND_DATA
     var h = findFirstFile(file, f)
-    if h == -1'i32: raiseOSError(osLastError())
+    if h == -1'i32: raiseOSError(osLastError(), file)
     result = fromWinTime(rdFileTime(f.ftLastWriteTime))
     findClose(h)
 
 proc getLastAccessTime*(file: string): times.Time {.rtl, extern: "nos$1", noNimScript.} =
   ## Returns the `file`'s last read or write access time.
+  ##
+  ## See also:
+  ## * `getLastModificationTime proc <#getLastModificationTime,string>`_
+  ## * `getCreationTime proc <#getCreationTime,string>`_
+  ## * `fileNewer proc <#fileNewer,string,string>`_
   when defined(posix):
     var res: Stat
-    if stat(file, res) < 0'i32: raiseOSError(osLastError())
+    if stat(file, res) < 0'i32: raiseOSError(osLastError(), file)
     result = res.st_atim.toTime
   else:
     var f: WIN32_FIND_DATA
     var h = findFirstFile(file, f)
-    if h == -1'i32: raiseOSError(osLastError())
+    if h == -1'i32: raiseOSError(osLastError(), file)
     result = fromWinTime(rdFileTime(f.ftLastAccessTime))
     findClose(h)
 
@@ -854,20 +1273,30 @@ proc getCreationTime*(file: string): times.Time {.rtl, extern: "nos$1", noNimScr
   ## **Note:** Under POSIX OS's, the returned time may actually be the time at
   ## which the file's attribute's were last modified. See
   ## `here <https://github.com/nim-lang/Nim/issues/1058>`_ for details.
+  ##
+  ## See also:
+  ## * `getLastModificationTime proc <#getLastModificationTime,string>`_
+  ## * `getLastAccessTime proc <#getLastAccessTime,string>`_
+  ## * `fileNewer proc <#fileNewer,string,string>`_
   when defined(posix):
     var res: Stat
-    if stat(file, res) < 0'i32: raiseOSError(osLastError())
+    if stat(file, res) < 0'i32: raiseOSError(osLastError(), file)
     result = res.st_ctim.toTime
   else:
     var f: WIN32_FIND_DATA
     var h = findFirstFile(file, f)
-    if h == -1'i32: raiseOSError(osLastError())
+    if h == -1'i32: raiseOSError(osLastError(), file)
     result = fromWinTime(rdFileTime(f.ftCreationTime))
     findClose(h)
 
 proc fileNewer*(a, b: string): bool {.rtl, extern: "nos$1", noNimScript.} =
   ## Returns true if the file `a` is newer than file `b`, i.e. if `a`'s
   ## modification time is later than `b`'s.
+  ##
+  ## See also:
+  ## * `getLastModificationTime proc <#getLastModificationTime,string>`_
+  ## * `getLastAccessTime proc <#getLastAccessTime,string>`_
+  ## * `getCreationTime proc <#getCreationTime,string>`_
   when defined(posix):
     # If we don't have access to nanosecond resolution, use '>='
     when not StatHasNanoseconds:
@@ -877,126 +1306,128 @@ proc fileNewer*(a, b: string): bool {.rtl, extern: "nos$1", noNimScript.} =
   else:
     result = getLastModificationTime(a) > getLastModificationTime(b)
 
-proc getCurrentDir*(): string {.rtl, extern: "nos$1", tags: [], noNimScript.} =
-  ## Returns the `current working directory`:idx:.
-  when defined(windows):
-    var bufsize = MAX_PATH.int32
-    when useWinUnicode:
-      var res = newWideCString("", bufsize)
-      while true:
-        var L = getCurrentDirectoryW(bufsize, res)
-        if L == 0'i32:
-          raiseOSError(osLastError())
-        elif L > bufsize:
-          res = newWideCString("", L)
-          bufsize = L
-        else:
-          result = res$L
-          break
+when not defined(nimscript):
+  proc getCurrentDir*(): string {.rtl, extern: "nos$1", tags: [].} =
+    ## Returns the `current working directory`:idx: i.e. where the built
+    ## binary is run.
+    ##
+    ## So the path returned by this proc is determined at run time.
+    ##
+    ## See also:
+    ## * `getHomeDir proc <#getHomeDir>`_
+    ## * `getConfigDir proc <#getConfigDir>`_
+    ## * `getTempDir proc <#getTempDir>`_
+    ## * `setCurrentDir proc <#setCurrentDir,string>`_
+    ## * `currentSourcePath template <system.html#currentSourcePath.t>`_
+    ## * `getProjectPath proc <macros.html#getProjectPath>`_
+    when defined(nodejs):
+      var ret: cstring
+      {.emit: "`ret` = process.cwd();".}
+      return $ret
+    elif defined(js):
+      doAssert false, "use -d:nodejs to have `getCurrentDir` defined"
+    elif defined(windows):
+      var bufsize = MAX_PATH.int32
+      when useWinUnicode:
+        var res = newWideCString("", bufsize)
+        while true:
+          var L = getCurrentDirectoryW(bufsize, res)
+          if L == 0'i32:
+            raiseOSError(osLastError())
+          elif L > bufsize:
+            res = newWideCString("", L)
+            bufsize = L
+          else:
+            result = res$L
+            break
+      else:
+        result = newString(bufsize)
+        while true:
+          var L = getCurrentDirectoryA(bufsize, result)
+          if L == 0'i32:
+            raiseOSError(osLastError())
+          elif L > bufsize:
+            result = newString(L)
+            bufsize = L
+          else:
+            setLen(result, L)
+            break
     else:
+      var bufsize = 1024 # should be enough
       result = newString(bufsize)
       while true:
-        var L = getCurrentDirectoryA(bufsize, result)
-        if L == 0'i32:
-          raiseOSError(osLastError())
-        elif L > bufsize:
-          result = newString(L)
-          bufsize = L
-        else:
-          setLen(result, L)
+        if getcwd(result, bufsize) != nil:
+          setLen(result, c_strlen(result))
           break
-  else:
-    var bufsize = 1024 # should be enough
-    result = newString(bufsize)
-    while true:
-      if getcwd(result, bufsize) != nil:
-        setLen(result, c_strlen(result))
-        break
-      else:
-        let err = osLastError()
-        if err.int32 == ERANGE:
-          bufsize = bufsize shl 1
-          doAssert(bufsize >= 0)
-          result = newString(bufsize)
         else:
-          raiseOSError(osLastError())
+          let err = osLastError()
+          if err.int32 == ERANGE:
+            bufsize = bufsize shl 1
+            doAssert(bufsize >= 0)
+            result = newString(bufsize)
+          else:
+            raiseOSError(osLastError())
 
 proc setCurrentDir*(newDir: string) {.inline, tags: [], noNimScript.} =
-  ## Sets the `current working directory`:idx:; `OSError` is raised if
-  ## `newDir` cannot been set.
+  ## Sets the `current working directory`:idx:; `OSError`
+  ## is raised if `newDir` cannot been set.
+  ##
+  ## See also:
+  ## * `getHomeDir proc <#getHomeDir>`_
+  ## * `getConfigDir proc <#getConfigDir>`_
+  ## * `getTempDir proc <#getTempDir>`_
+  ## * `getCurrentDir proc <#getCurrentDir>`_
   when defined(Windows):
     when useWinUnicode:
       if setCurrentDirectoryW(newWideCString(newDir)) == 0'i32:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), newDir)
     else:
-      if setCurrentDirectoryA(newDir) == 0'i32: raiseOSError(osLastError())
+      if setCurrentDirectoryA(newDir) == 0'i32: raiseOSError(osLastError(), newDir)
   else:
-    if chdir(newDir) != 0'i32: raiseOSError(osLastError())
+    if chdir(newDir) != 0'i32: raiseOSError(osLastError(), newDir)
 
-when not weirdTarget:
-  proc absolutePath*(path: string, root = getCurrentDir()): string {.noNimScript.} =
-    ## Returns the absolute path of `path`, rooted at `root` (which must be absolute)
-    ## if `path` is absolute, return it, ignoring `root`
-    runnableExamples:
-      doAssert absolutePath("a") == getCurrentDir() / "a"
-    if isAbsolute(path): path
-    else:
-      if not root.isAbsolute:
-        raise newException(ValueError, "The specified root is not absolute: " & root)
-      joinPath(root, path)
 
-proc expandFilename*(filename: string): string {.rtl, extern: "nos$1",
-  tags: [ReadDirEffect], noNimScript.} =
-  ## Returns the full (`absolute`:idx:) path of an existing file `filename`,
-  ## raises OSError in case of an error. Follows symlinks.
-  when defined(windows):
-    var bufsize = MAX_PATH.int32
-    when useWinUnicode:
-      var unused: WideCString = nil
-      var res = newWideCString("", bufsize)
-      while true:
-        var L = getFullPathNameW(newWideCString(filename), bufsize, res, unused)
-        if L == 0'i32:
-          raiseOSError(osLastError())
-        elif L > bufsize:
-          res = newWideCString("", L)
-          bufsize = L
-        else:
-          result = res$L
-          break
-    else:
-      var unused: cstring = nil
-      result = newString(bufsize)
-      while true:
-        var L = getFullPathNameA(filename, bufsize, result, unused)
-        if L == 0'i32:
-          raiseOSError(osLastError())
-        elif L > bufsize:
-          result = newString(L)
-          bufsize = L
-        else:
-          setLen(result, L)
-          break
+proc absolutePath*(path: string, root = getCurrentDir()): string =
+  ## Returns the absolute path of `path`, rooted at `root` (which must be absolute;
+  ## default: current directory).
+  ## If `path` is absolute, return it, ignoring `root`.
+  ##
+  ## See also:
+  ## * `normalizedPath proc <#normalizedPath,string>`_
+  ## * `normalizePath proc <#normalizePath,string>`_
+  runnableExamples:
+    assert absolutePath("a") == getCurrentDir() / "a"
+
+  if isAbsolute(path): path
   else:
-    # according to Posix we don't need to allocate space for result pathname.
-    # But we need to free return value with free(3).
-    var r = realpath(filename, nil)
-    if r.isNil:
-      raiseOSError(osLastError())
-    else:
-      result = $r
-      c_free(cast[pointer](r))
+    if not root.isAbsolute:
+      raise newException(ValueError, "The specified root is not absolute: " & root)
+    joinPath(root, path)
 
-proc normalizePath*(path: var string) {.rtl, extern: "nos$1", tags: [], noNimScript.} =
+proc absolutePathInternal(path: string): string =
+  absolutePath(path, getCurrentDir())
+
+proc normalizePath*(path: var string) {.rtl, extern: "nos$1", tags: [].} =
   ## Normalize a path.
   ##
   ## Consecutive directory separators are collapsed, including an initial double slash.
   ##
-  ## On relative paths, double dot (..) sequences are collapsed if possible.
+  ## On relative paths, double dot (`..`) sequences are collapsed if possible.
   ## On absolute paths they are always collapsed.
   ##
   ## Warning: URL-encoded and Unicode attempts at directory traversal are not detected.
   ## Triple dot is not handled.
+  ##
+  ## See also:
+  ## * `absolutePath proc <#absolutePath,string>`_
+  ## * `normalizedPath proc <#normalizedPath,string>`_ for a version which returns
+  ##   a new string
+  runnableExamples:
+    when defined(posix):
+      var a = "a///b//..//c///d"
+      a.normalizePath()
+      assert a == "a/c/d"
+
   path = pathnorm.normalizePath(path)
   when false:
     let isAbs = isAbsolute(path)
@@ -1025,8 +1456,17 @@ proc normalizePath*(path: var string) {.rtl, extern: "nos$1", tags: [], noNimScr
     else:
       path = "."
 
-proc normalizedPath*(path: string): string {.rtl, extern: "nos$1", tags: [], noNimScript.} =
-  ## Returns a normalized path for the current OS. See `<#normalizePath>`_
+proc normalizePathAux(path: var string) = normalizePath(path)
+
+proc normalizedPath*(path: string): string {.rtl, extern: "nos$1", tags: [].} =
+  ## Returns a normalized path for the current OS.
+  ##
+  ## See also:
+  ## * `absolutePath proc <#absolutePath,string>`_
+  ## * `normalizePath proc <#normalizePath,string>`_ for the in-place version
+  runnableExamples:
+    when defined(posix):
+      assert normalizedPath("a///b//..//c///d") == "a/c/d"
   result = pathnorm.normalizePath(path)
 
 when defined(Windows) and not weirdTarget:
@@ -1052,11 +1492,16 @@ when defined(Windows) and not weirdTarget:
 proc sameFile*(path1, path2: string): bool {.rtl, extern: "nos$1",
   tags: [ReadDirEffect], noNimScript.} =
   ## Returns true if both pathname arguments refer to the same physical
-  ## file or directory. Raises an exception if any of the files does not
+  ## file or directory.
+  ##
+  ## Raises `OSError` if any of the files does not
   ## exist or information about it can not be obtained.
   ##
   ## This proc will return true if given two alternative hard-linked or
   ## sym-linked paths to the same file or directory.
+  ##
+  ## See also:
+  ## * `sameFileContent proc <#sameFileContent,string,string>`_
   when defined(Windows):
     var success = true
     var f1 = openHandle(path1)
@@ -1081,11 +1526,11 @@ proc sameFile*(path1, path2: string): bool {.rtl, extern: "nos$1",
     discard closeHandle(f1)
     discard closeHandle(f2)
 
-    if not success: raiseOSError(lastErr)
+    if not success: raiseOSError(lastErr, $(path1, path2))
   else:
     var a, b: Stat
     if stat(path1, a) < 0'i32 or stat(path2, b) < 0'i32:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), $(path1, path2))
     else:
       result = a.st_dev == b.st_dev and a.st_ino == b.st_ino
 
@@ -1093,6 +1538,9 @@ proc sameFileContent*(path1, path2: string): bool {.rtl, extern: "nos$1",
   tags: [ReadIOEffect], noNimScript.} =
   ## Returns true if both pathname arguments refer to files with identical
   ## binary content.
+  ##
+  ## See also:
+  ## * `sameFile proc <#sameFile,string,string>`_
   const
     bufSize = 8192 # 8K buffer
   var
@@ -1121,7 +1569,12 @@ proc sameFileContent*(path1, path2: string): bool {.rtl, extern: "nos$1",
   close(b)
 
 type
-  FilePermission* = enum   ## file access permission; modelled after UNIX
+  FilePermission* = enum   ## File access permission, modelled after UNIX.
+    ##
+    ## See also:
+    ## * `getFilePermissions <#getFilePermissions,string>`_
+    ## * `setFilePermissions <#setFilePermissions,string,set[FilePermission]>`_
+    ## * `FileInfo object <#FileInfo>`_
     fpUserExec,            ## execute access for the file owner
     fpUserWrite,           ## write access for the file owner
     fpUserRead,            ## read access for the file owner
@@ -1134,30 +1587,36 @@ type
 
 proc getFilePermissions*(filename: string): set[FilePermission] {.
   rtl, extern: "nos$1", tags: [ReadDirEffect], noNimScript.} =
-  ## retrieves file permissions for `filename`. `OSError` is raised in case of
-  ## an error. On Windows, only the ``readonly`` flag is checked, every other
+  ## Retrieves file permissions for `filename`.
+  ##
+  ## `OSError` is raised in case of an error.
+  ## On Windows, only the ``readonly`` flag is checked, every other
   ## permission is available in any case.
+  ##
+  ## See also:
+  ## * `setFilePermissions proc <#setFilePermissions,string,set[FilePermission]>`_
+  ## * `FilePermission enum <#FilePermission>`_
   when defined(posix):
     var a: Stat
-    if stat(filename, a) < 0'i32: raiseOSError(osLastError())
+    if stat(filename, a) < 0'i32: raiseOSError(osLastError(), filename)
     result = {}
-    if (a.st_mode and S_IRUSR) != 0'i32: result.incl(fpUserRead)
-    if (a.st_mode and S_IWUSR) != 0'i32: result.incl(fpUserWrite)
-    if (a.st_mode and S_IXUSR) != 0'i32: result.incl(fpUserExec)
+    if (a.st_mode and S_IRUSR.Mode) != 0.Mode: result.incl(fpUserRead)
+    if (a.st_mode and S_IWUSR.Mode) != 0.Mode: result.incl(fpUserWrite)
+    if (a.st_mode and S_IXUSR.Mode) != 0.Mode: result.incl(fpUserExec)
 
-    if (a.st_mode and S_IRGRP) != 0'i32: result.incl(fpGroupRead)
-    if (a.st_mode and S_IWGRP) != 0'i32: result.incl(fpGroupWrite)
-    if (a.st_mode and S_IXGRP) != 0'i32: result.incl(fpGroupExec)
+    if (a.st_mode and S_IRGRP.Mode) != 0.Mode: result.incl(fpGroupRead)
+    if (a.st_mode and S_IWGRP.Mode) != 0.Mode: result.incl(fpGroupWrite)
+    if (a.st_mode and S_IXGRP.Mode) != 0.Mode: result.incl(fpGroupExec)
 
-    if (a.st_mode and S_IROTH) != 0'i32: result.incl(fpOthersRead)
-    if (a.st_mode and S_IWOTH) != 0'i32: result.incl(fpOthersWrite)
-    if (a.st_mode and S_IXOTH) != 0'i32: result.incl(fpOthersExec)
+    if (a.st_mode and S_IROTH.Mode) != 0.Mode: result.incl(fpOthersRead)
+    if (a.st_mode and S_IWOTH.Mode) != 0.Mode: result.incl(fpOthersWrite)
+    if (a.st_mode and S_IXOTH.Mode) != 0.Mode: result.incl(fpOthersExec)
   else:
     when useWinUnicode:
       wrapUnary(res, getFileAttributesW, filename)
     else:
       var res = getFileAttributesA(filename)
-    if res == -1'i32: raiseOSError(osLastError())
+    if res == -1'i32: raiseOSError(osLastError(), filename)
     if (res and FILE_ATTRIBUTE_READONLY) != 0'i32:
       result = {fpUserExec, fpUserRead, fpGroupExec, fpGroupRead,
                 fpOthersExec, fpOthersRead}
@@ -1166,30 +1625,36 @@ proc getFilePermissions*(filename: string): set[FilePermission] {.
 
 proc setFilePermissions*(filename: string, permissions: set[FilePermission]) {.
   rtl, extern: "nos$1", tags: [WriteDirEffect], noNimScript.} =
-  ## sets the file permissions for `filename`. `OSError` is raised in case of
-  ## an error. On Windows, only the ``readonly`` flag is changed, depending on
-  ## ``fpUserWrite``.
+  ## Sets the file permissions for `filename`.
+  ##
+  ## `OSError` is raised in case of an error.
+  ## On Windows, only the ``readonly`` flag is changed, depending on
+  ## ``fpUserWrite`` permission.
+  ##
+  ## See also:
+  ## * `getFilePermissions <#getFilePermissions,string>`_
+  ## * `FilePermission enum <#FilePermission>`_
   when defined(posix):
-    var p = 0'i32
-    if fpUserRead in permissions: p = p or S_IRUSR
-    if fpUserWrite in permissions: p = p or S_IWUSR
-    if fpUserExec in permissions: p = p or S_IXUSR
+    var p = 0.Mode
+    if fpUserRead in permissions: p = p or S_IRUSR.Mode
+    if fpUserWrite in permissions: p = p or S_IWUSR.Mode
+    if fpUserExec in permissions: p = p or S_IXUSR.Mode
 
-    if fpGroupRead in permissions: p = p or S_IRGRP
-    if fpGroupWrite in permissions: p = p or S_IWGRP
-    if fpGroupExec in permissions: p = p or S_IXGRP
+    if fpGroupRead in permissions: p = p or S_IRGRP.Mode
+    if fpGroupWrite in permissions: p = p or S_IWGRP.Mode
+    if fpGroupExec in permissions: p = p or S_IXGRP.Mode
 
-    if fpOthersRead in permissions: p = p or S_IROTH
-    if fpOthersWrite in permissions: p = p or S_IWOTH
-    if fpOthersExec in permissions: p = p or S_IXOTH
+    if fpOthersRead in permissions: p = p or S_IROTH.Mode
+    if fpOthersWrite in permissions: p = p or S_IWOTH.Mode
+    if fpOthersExec in permissions: p = p or S_IXOTH.Mode
 
-    if chmod(filename, p) != 0: raiseOSError(osLastError())
+    if chmod(filename, cast[Mode](p)) != 0: raiseOSError(osLastError(), $(filename, permissions))
   else:
     when useWinUnicode:
       wrapUnary(res, getFileAttributesW, filename)
     else:
       var res = getFileAttributesA(filename)
-    if res == -1'i32: raiseOSError(osLastError())
+    if res == -1'i32: raiseOSError(osLastError(), filename)
     if fpUserWrite in permissions:
       res = res and not FILE_ATTRIBUTE_READONLY
     else:
@@ -1198,35 +1663,50 @@ proc setFilePermissions*(filename: string, permissions: set[FilePermission]) {.
       wrapBinary(res2, setFileAttributesW, filename, res)
     else:
       var res2 = setFileAttributesA(filename, res)
-    if res2 == - 1'i32: raiseOSError(osLastError())
+    if res2 == - 1'i32: raiseOSError(osLastError(), $(filename, permissions))
 
 proc copyFile*(source, dest: string) {.rtl, extern: "nos$1",
   tags: [ReadIOEffect, WriteIOEffect], noNimScript.} =
   ## Copies a file from `source` to `dest`.
   ##
-  ## If this fails, `OSError` is raised. On the Windows platform this proc will
-  ## copy the source file's attributes into dest. On other platforms you need
-  ## to use `getFilePermissions() <#getFilePermissions>`_ and
-  ## `setFilePermissions() <#setFilePermissions>`_ to copy them by hand (or use
-  ## the convenience `copyFileWithPermissions() <#copyFileWithPermissions>`_
-  ## proc), otherwise `dest` will inherit the default permissions of a newly
-  ## created file for the user. If `dest` already exists, the file attributes
+  ## If this fails, `OSError` is raised.
+  ##
+  ## On the Windows platform this proc will
+  ## copy the source file's attributes into dest.
+  ##
+  ## On other platforms you need
+  ## to use `getFilePermissions <#getFilePermissions,string>`_ and
+  ## `setFilePermissions <#setFilePermissions,string,set[FilePermission]>`_ procs
+  ## to copy them by hand (or use the convenience `copyFileWithPermissions
+  ## proc <#copyFileWithPermissions,string,string>`_),
+  ## otherwise `dest` will inherit the default permissions of a newly
+  ## created file for the user.
+  ##
+  ## If `dest` already exists, the file attributes
   ## will be preserved and the content overwritten.
+  ##
+  ## See also:
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `tryRemoveFile proc <#tryRemoveFile,string>`_
+  ## * `removeFile proc <#removeFile,string>`_
+  ## * `moveFile proc <#moveFile,string,string>`_
+
   when defined(Windows):
     when useWinUnicode:
       let s = newWideCString(source)
       let d = newWideCString(dest)
-      if copyFileW(s, d, 0'i32) == 0'i32: raiseOSError(osLastError())
+      if copyFileW(s, d, 0'i32) == 0'i32: raiseOSError(osLastError(), $(source, dest))
     else:
-      if copyFileA(source, dest, 0'i32) == 0'i32: raiseOSError(osLastError())
+      if copyFileA(source, dest, 0'i32) == 0'i32: raiseOSError(osLastError(), $(source, dest))
   else:
     # generic version of copyFile which works for any platform:
     const bufSize = 8000 # better for memory manager
     var d, s: File
-    if not open(s, source): raiseOSError(osLastError())
+    if not open(s, source): raiseOSError(osLastError(), source)
     if not open(d, dest, fmWrite):
       close(s)
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), dest)
     var buf = alloc(bufSize)
     while true:
       var bytesread = readBuffer(s, buf, bufSize)
@@ -1236,7 +1716,7 @@ proc copyFile*(source, dest: string) {.rtl, extern: "nos$1",
           dealloc(buf)
           close(s)
           close(d)
-          raiseOSError(osLastError())
+          raiseOSError(osLastError(), dest)
       if bytesread != bufSize: break
     dealloc(buf)
     close(s)
@@ -1263,9 +1743,18 @@ when defined(Windows) and not weirdTarget:
       setFileAttributesA(file, attrs)
 
 proc tryRemoveFile*(file: string): bool {.rtl, extern: "nos$1", tags: [WriteDirEffect], noNimScript.} =
-  ## Removes the `file`. If this fails, returns `false`. This does not fail
+  ## Removes the `file`.
+  ##
+  ## If this fails, returns `false`. This does not fail
   ## if the file never existed in the first place.
+  ##
   ## On Windows, ignores the read-only attribute.
+  ##
+  ## See also:
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `removeFile proc <#removeFile,string>`_
+  ## * `moveFile proc <#moveFile,string,string>`_
   result = true
   when defined(Windows):
     when useWinUnicode:
@@ -1286,39 +1775,61 @@ proc tryRemoveFile*(file: string): bool {.rtl, extern: "nos$1", tags: [WriteDirE
       result = false
 
 proc removeFile*(file: string) {.rtl, extern: "nos$1", tags: [WriteDirEffect], noNimScript.} =
-  ## Removes the `file`. If this fails, `OSError` is raised. This does not fail
+  ## Removes the `file`.
+  ##
+  ## If this fails, `OSError` is raised. This does not fail
   ## if the file never existed in the first place.
+  ##
   ## On Windows, ignores the read-only attribute.
+  ##
+  ## See also:
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `tryRemoveFile proc <#tryRemoveFile,string>`_
+  ## * `moveFile proc <#moveFile,string,string>`_
   if not tryRemoveFile(file):
-    when defined(Windows):
-      raiseOSError(osLastError())
-    else:
-      raiseOSError(osLastError(), $strerror(errno))
+    raiseOSError(osLastError(), file)
 
 proc tryMoveFSObject(source, dest: string): bool {.noNimScript.} =
-  ## Moves a file or directory from `source` to `dest`. Returns false in case
-  ## of `EXDEV` error. In case of other errors `OSError` is raised. Returns
-  ## true in case of success.
+  ## Moves a file or directory from `source` to `dest`.
+  ##
+  ## Returns false in case of `EXDEV` error.
+  ## In case of other errors `OSError` is raised.
+  ## Returns true in case of success.
   when defined(Windows):
     when useWinUnicode:
       let s = newWideCString(source)
       let d = newWideCString(dest)
-      if moveFileExW(s, d, MOVEFILE_COPY_ALLOWED) == 0'i32: raiseOSError(osLastError())
+      if moveFileExW(s, d, MOVEFILE_COPY_ALLOWED or MOVEFILE_REPLACE_EXISTING) == 0'i32: raiseOSError(osLastError(), $(source, dest))
     else:
-      if moveFileExA(source, dest, MOVEFILE_COPY_ALLOWED) == 0'i32: raiseOSError(osLastError())
+      if moveFileExA(source, dest, MOVEFILE_COPY_ALLOWED or MOVEFILE_REPLACE_EXISTING) == 0'i32: raiseOSError(osLastError(), $(source, dest))
   else:
     if c_rename(source, dest) != 0'i32:
       let err = osLastError()
       if err == EXDEV.OSErrorCode:
         return false
       else:
-        raiseOSError(err, $strerror(errno))
+        # see whether `strerror(errno)` is redundant with what raiseOSError already shows
+        raiseOSError(err, $(source, dest, strerror(errno)))
   return true
 
 proc moveFile*(source, dest: string) {.rtl, extern: "nos$1",
   tags: [ReadIOEffect, WriteIOEffect], noNimScript.} =
-  ## Moves a file from `source` to `dest`. If this fails, `OSError` is raised.
-  ## Can be used to `rename files`:idx:
+  ## Moves a file from `source` to `dest`.
+  ##
+  ## If this fails, `OSError` is raised.
+  ## If `dest` already exists, it will be overwritten.
+  ##
+  ## Can be used to `rename files`:idx:.
+  ##
+  ## See also:
+  ## * `moveDir proc <#moveDir,string,string>`_
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `removeFile proc <#removeFile,string>`_
+  ## * `tryRemoveFile proc <#tryRemoveFile,string>`_
+
   if not tryMoveFSObject(source, dest):
     when not defined(windows):
       # Fallback to copy & del
@@ -1329,20 +1840,34 @@ proc moveFile*(source, dest: string) {.rtl, extern: "nos$1",
         discard tryRemoveFile(dest)
         raise
 
+proc exitStatusLikeShell*(status: cint): cint =
+  ## Converts exit code from `c_system` into a shell exit code.
+  when defined(posix) and not weirdTarget:
+    if WIFSIGNALED(status):
+      # like the shell!
+      128 + WTERMSIG(status)
+    else:
+      WEXITSTATUS(status)
+  else:
+    status
+
 proc execShellCmd*(command: string): int {.rtl, extern: "nos$1",
   tags: [ExecIOEffect], noNimScript.} =
   ## Executes a `shell command`:idx:.
   ##
   ## Command has the form 'program args' where args are the command
   ## line arguments given to program. The proc returns the error code
-  ## of the shell when it has finished. The proc does not return until
-  ## the process has finished. To execute a program without having a
-  ## shell involved, use the `execProcess` proc of the `osproc`
-  ## module.
-  when defined(posix):
-    result = c_system(command) shr 8
-  else:
-    result = c_system(command)
+  ## of the shell when it has finished (zero if there is no error).
+  ## The proc does not return until the process has finished.
+  ##
+  ## To execute a program without having a shell involved, use `osproc.execProcess proc
+  ## <osproc.html#execProcess,string,string,openArray[string],StringTableRef,set[ProcessOption]>`_.
+  ##
+  ## **Examples:**
+  ##
+  ## .. code-block::
+  ##   discard execShellCmd("ls -la")
+  result = exitStatusLikeShell(c_system(command))
 
 # Templates for filtering directories and files
 when defined(windows) and not weirdTarget:
@@ -1378,8 +1903,8 @@ template walkCommon(pattern: string, filter) =
           # that the file extensions have the same length ...
           let ff = getFilename(f)
           let idx = ff.len - pattern.len + dotPos
-          if dotPos < 0 or idx >= ff.len or ff[idx] == '.' or
-              pattern[dotPos+1] == '*':
+          if dotPos < 0 or idx >= ff.len or (idx >= 0 and ff[idx] == '.') or
+              (dotPos >= 0 and dotPos+1 < pattern.len and pattern[dotPos+1] == '*'):
             yield splitFile(pattern).dir / extractFilename(ff)
         if findNextFile(res, f) == 0'i32:
           let errCode = getLastError()
@@ -1403,37 +1928,111 @@ template walkCommon(pattern: string, filter) =
 
 iterator walkPattern*(pattern: string): string {.tags: [ReadDirEffect], noNimScript.} =
   ## Iterate over all the files and directories that match the `pattern`.
-  ## On POSIX this uses the `glob`:idx: call.
   ##
-  ## `pattern` is OS dependent, but at least the "\*.ext"
+  ## On POSIX this uses the `glob`:idx: call.
+  ## `pattern` is OS dependent, but at least the `"\*.ext"`
   ## notation is supported.
+  ##
+  ## See also:
+  ## * `walkFiles iterator <#walkFiles.i,string>`_
+  ## * `walkDirs iterator <#walkDirs.i,string>`_
+  ## * `walkDir iterator <#walkDir.i,string>`_
+  ## * `walkDirRec iterator <#walkDirRec.i,string>`_
   walkCommon(pattern, defaultWalkFilter)
 
 iterator walkFiles*(pattern: string): string {.tags: [ReadDirEffect], noNimScript.} =
-  ## Iterate over all the files that match the `pattern`. On POSIX this uses
-  ## the `glob`:idx: call.
+  ## Iterate over all the files that match the `pattern`.
   ##
-  ## `pattern` is OS dependent, but at least the "\*.ext"
+  ## On POSIX this uses the `glob`:idx: call.
+  ## `pattern` is OS dependent, but at least the `"\*.ext"`
   ## notation is supported.
+  ##
+  ## See also:
+  ## * `walkPattern iterator <#walkPattern.i,string>`_
+  ## * `walkDirs iterator <#walkDirs.i,string>`_
+  ## * `walkDir iterator <#walkDir.i,string>`_
+  ## * `walkDirRec iterator <#walkDirRec.i,string>`_
   walkCommon(pattern, isFile)
 
 iterator walkDirs*(pattern: string): string {.tags: [ReadDirEffect], noNimScript.} =
   ## Iterate over all the directories that match the `pattern`.
-  ## On POSIX this uses the `glob`:idx: call.
   ##
-  ## `pattern` is OS dependent, but at least the "\*.ext"
+  ## On POSIX this uses the `glob`:idx: call.
+  ## `pattern` is OS dependent, but at least the `"\*.ext"`
   ## notation is supported.
+  ##
+  ## See also:
+  ## * `walkPattern iterator <#walkPattern.i,string>`_
+  ## * `walkFiles iterator <#walkFiles.i,string>`_
+  ## * `walkDir iterator <#walkDir.i,string>`_
+  ## * `walkDirRec iterator <#walkDirRec.i,string>`_
   walkCommon(pattern, isDir)
+
+proc expandFilename*(filename: string): string {.rtl, extern: "nos$1",
+  tags: [ReadDirEffect], noNimScript.} =
+  ## Returns the full (`absolute`:idx:) path of an existing file `filename`.
+  ##
+  ## Raises `OSError` in case of an error. Follows symlinks.
+  when defined(windows):
+    var bufsize = MAX_PATH.int32
+    when useWinUnicode:
+      var unused: WideCString = nil
+      var res = newWideCString("", bufsize)
+      while true:
+        var L = getFullPathNameW(newWideCString(filename), bufsize, res, unused)
+        if L == 0'i32:
+          raiseOSError(osLastError(), filename)
+        elif L > bufsize:
+          res = newWideCString("", L)
+          bufsize = L
+        else:
+          result = res$L
+          break
+    else:
+      var unused: cstring = nil
+      result = newString(bufsize)
+      while true:
+        var L = getFullPathNameA(filename, bufsize, result, unused)
+        if L == 0'i32:
+          raiseOSError(osLastError(), filename)
+        elif L > bufsize:
+          result = newString(L)
+          bufsize = L
+        else:
+          setLen(result, L)
+          break
+    # getFullPathName doesn't do case corrections, so we have to use this convoluted
+    # way of retrieving the true filename
+    for x in walkFiles(result):
+      result = x
+    if not existsFile(result) and not existsDir(result):
+      # consider using: `raiseOSError(osLastError(), result)`
+      raise newException(OSError, "file '" & result & "' does not exist")
+  else:
+    # according to Posix we don't need to allocate space for result pathname.
+    # But we need to free return value with free(3).
+    var r = realpath(filename, nil)
+    if r.isNil:
+      raiseOSError(osLastError(), filename)
+    else:
+      result = $r
+      c_free(cast[pointer](r))
 
 type
   PathComponent* = enum   ## Enumeration specifying a path component.
+    ##
+    ## See also:
+    ## * `walkDirRec iterator <#walkDirRec.i,string>`_
+    ## * `FileInfo object <#FileInfo>`_
     pcFile,               ## path refers to a file
     pcLinkToFile,         ## path refers to a symbolic link to a file
     pcDir,                ## path refers to a directory
     pcLinkToDir           ## path refers to a symbolic link to a directory
 
 proc getCurrentCompilerExe*(): string {.compileTime.} = discard
-  ## `getAppFilename` at CT; can be used to retrive the currently executing
+  ## This is `getAppFilename() <#getAppFilename>`_ at compile time.
+  ##
+  ## Can be used to retrieve the currently executing
   ## Nim compiler from a Nim or nimscript program, or the nimble binary
   ## inside a nimble program (likewise with other binaries built from
   ## compiler API).
@@ -1452,12 +2051,13 @@ proc staticWalkDir(dir: string; relative: bool): seq[
                   tuple[kind: PathComponent, path: string]] =
   discard
 
-iterator walkDir*(dir: string; relative=false): tuple[kind: PathComponent, path: string] {.
-  tags: [ReadDirEffect].} =
-  ## walks over the directory `dir` and yields for each directory or file in
-  ## `dir`. The component type and full path for each item is returned.
-  ## Walking is not recursive. If ``relative`` is true the resulting path is
-  ## shortened to be relative to ``dir``.
+iterator walkDir*(dir: string; relative = false, checkDir = false):
+  tuple[kind: PathComponent, path: string] {.tags: [ReadDirEffect].} =
+  ## Walks over the directory `dir` and yields for each directory or file in
+  ## `dir`. The component type and full path for each item are returned.
+  ##
+  ## Walking is not recursive. If ``relative`` is true (default: false)
+  ## the resulting path is shortened to be relative to ``dir``.
   ## Example: This directory structure::
   ##   dirA / dirB / fileB1.txt
   ##        / dirC
@@ -1470,11 +2070,18 @@ iterator walkDir*(dir: string; relative=false): tuple[kind: PathComponent, path:
   ##     for kind, path in walkDir("dirA"):
   ##       echo(path)
   ##
-  ## produces this output (but not necessarily in this order!)::
+  ## produce this output (but not necessarily in this order!)::
   ##   dirA/dirB
   ##   dirA/dirC
   ##   dirA/fileA1.txt
   ##   dirA/fileA2.txt
+  ##
+  ## See also:
+  ## * `walkPattern iterator <#walkPattern.i,string>`_
+  ## * `walkFiles iterator <#walkFiles.i,string>`_
+  ## * `walkDirs iterator <#walkDirs.i,string>`_
+  ## * `walkDirRec iterator <#walkDirRec.i,string>`_
+
   when nimvm:
     for k, v in items(staticWalkDir(dir, relative)):
       yield (k, v)
@@ -1485,7 +2092,10 @@ iterator walkDir*(dir: string; relative=false): tuple[kind: PathComponent, path:
     elif defined(windows):
       var f: WIN32_FIND_DATA
       var h = findFirstFile(dir / "*", f)
-      if h != -1:
+      if h == -1:
+        if checkDir:
+          raiseOSError(osLastError(), dir)
+      else:
         defer: findClose(h)
         while true:
           var k = pcFile
@@ -1503,7 +2113,10 @@ iterator walkDir*(dir: string; relative=false): tuple[kind: PathComponent, path:
             else: raiseOSError(errCode.OSErrorCode)
     else:
       var d = opendir(dir)
-      if d != nil:
+      if d == nil:
+        if checkDir:
+          raiseOSError(osLastError(), dir)
+      else:
         defer: discard closedir(d)
         while true:
           var x = readdir(d)
@@ -1538,22 +2151,23 @@ iterator walkDir*(dir: string; relative=false): tuple[kind: PathComponent, path:
 
 iterator walkDirRec*(dir: string,
                      yieldFilter = {pcFile}, followFilter = {pcDir},
-                     relative = false): string {.tags: [ReadDirEffect].} =
+                     relative = false, checkDir = false): string {.tags: [ReadDirEffect].} =
   ## Recursively walks over the directory `dir` and yields for each file
   ## or directory in `dir`.
-  ## If ``relative`` is true the resulting path is
+  ##
+  ## If ``relative`` is true (default: false) the resulting path is
   ## shortened to be relative to ``dir``, otherwise the full path is returned.
   ##
   ## **Warning**:
   ## Modifying the directory structure while the iterator
   ## is traversing may result in undefined behavior!
   ##
-  ## Walking is recursive. `filters` controls the behaviour of the iterator:
+  ## Walking is recursive. `followFilter` controls the behaviour of the iterator:
   ##
   ## ---------------------   ---------------------------------------------
   ## yieldFilter             meaning
   ## ---------------------   ---------------------------------------------
-  ## ``pcFile``              yield real files
+  ## ``pcFile``              yield real files (default)
   ## ``pcLinkToFile``        yield symbolic links to files
   ## ``pcDir``               yield real directories
   ## ``pcLinkToDir``         yield symbolic links to directories
@@ -1562,19 +2176,32 @@ iterator walkDirRec*(dir: string,
   ## ---------------------   ---------------------------------------------
   ## followFilter            meaning
   ## ---------------------   ---------------------------------------------
-  ## ``pcDir``               follow real directories
+  ## ``pcDir``               follow real directories (default)
   ## ``pcLinkToDir``         follow symbolic links to directories
   ## ---------------------   ---------------------------------------------
   ##
+  ##
+  ## See also:
+  ## * `walkPattern iterator <#walkPattern.i,string>`_
+  ## * `walkFiles iterator <#walkFiles.i,string>`_
+  ## * `walkDirs iterator <#walkDirs.i,string>`_
+  ## * `walkDir iterator <#walkDir.i,string>`_
+
   var stack = @[""]
+  var checkDir = checkDir
   while stack.len > 0:
     let d = stack.pop()
-    for k, p in walkDir(dir / d, relative = true):
+    for k, p in walkDir(dir / d, relative = true, checkDir = checkDir):
       let rel = d / p
       if k in {pcDir, pcLinkToDir} and k in followFilter:
         stack.add rel
       if k in yieldFilter:
         yield if relative: rel else: dir / rel
+    checkDir = false
+      # We only check top-level dir, otherwise if a subdir is invalid (eg. wrong
+      # permissions), it'll abort iteration and there would be no way to
+      # continue iteration.
+      # Future work can provide a way to customize this and do error reporting.
 
 proc rawRemoveDir(dir: string) {.noNimScript.} =
   when defined(windows):
@@ -1585,21 +2212,33 @@ proc rawRemoveDir(dir: string) {.noNimScript.} =
     let lastError = osLastError()
     if res == 0'i32 and lastError.int32 != 3'i32 and
         lastError.int32 != 18'i32 and lastError.int32 != 2'i32:
-      raiseOSError(lastError)
+      raiseOSError(lastError, dir)
   else:
-    if rmdir(dir) != 0'i32 and errno != ENOENT: raiseOSError(osLastError())
+    if rmdir(dir) != 0'i32 and errno != ENOENT: raiseOSError(osLastError(), dir)
 
-proc removeDir*(dir: string) {.rtl, extern: "nos$1", tags: [
+proc removeDir*(dir: string, checkDir = false) {.rtl, extern: "nos$1", tags: [
   WriteDirEffect, ReadDirEffect], benign, noNimScript.} =
   ## Removes the directory `dir` including all subdirectories and files
   ## in `dir` (recursively).
   ##
   ## If this fails, `OSError` is raised. This does not fail if the directory never
-  ## existed in the first place.
-  for kind, path in walkDir(dir):
+  ## existed in the first place, unless `checkDir` = true
+  ##
+  ## See also:
+  ## * `tryRemoveFile proc <#tryRemoveFile,string>`_
+  ## * `removeFile proc <#removeFile,string>`_
+  ## * `existsOrCreateDir proc <#existsOrCreateDir,string>`_
+  ## * `createDir proc <#createDir,string>`_
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## * `moveDir proc <#moveDir,string,string>`_
+  for kind, path in walkDir(dir, checkDir = checkDir):
     case kind
     of pcFile, pcLinkToFile, pcLinkToDir: removeFile(path)
-    of pcDir: removeDir(path)
+    of pcDir: removeDir(path, true)
+      # for subdirectories there is no benefit in `checkDir = false`
+      # (unless perhaps for edge case of concurrent processes also deleting
+      # the same files)
   rawRemoveDir(dir)
 
 proc rawCreateDir(dir: string): bool {.noNimScript.} =
@@ -1653,6 +2292,13 @@ proc existsOrCreateDir*(dir: string): bool {.rtl, extern: "nos$1",
   ## Does not create parent directories (fails if parent does not exist).
   ## Returns `true` if the directory already exists, and `false`
   ## otherwise.
+  ##
+  ## See also:
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `createDir proc <#createDir,string>`_
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## * `moveDir proc <#moveDir,string,string>`_
   result = not rawCreateDir(dir)
   if result:
     # path already exists - need to check that it is indeed a directory
@@ -1664,9 +2310,17 @@ proc createDir*(dir: string) {.rtl, extern: "nos$1",
   ## Creates the `directory`:idx: `dir`.
   ##
   ## The directory may contain several subdirectories that do not exist yet.
-  ## The full path is created. If this fails, `OSError` is raised. It does **not**
-  ## fail if the directory already exists because for most usages this does not
-  ## indicate an error.
+  ## The full path is created. If this fails, `OSError` is raised.
+  ##
+  ## It does **not** fail if the directory already exists because for
+  ## most usages this does not indicate an error.
+  ##
+  ## See also:
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `existsOrCreateDir proc <#existsOrCreateDir,string>`_
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## * `moveDir proc <#moveDir,string,string>`_
   var omitNext = false
   when doslikeFileSystem:
     omitNext = isAbsolute(dir)
@@ -1686,11 +2340,24 @@ proc copyDir*(source, dest: string) {.rtl, extern: "nos$1",
   tags: [WriteIOEffect, ReadIOEffect], benign, noNimScript.} =
   ## Copies a directory from `source` to `dest`.
   ##
-  ## If this fails, `OSError` is raised. On the Windows platform this proc will
-  ## copy the attributes from `source` into `dest`. On other platforms created
-  ## files and directories will inherit the default permissions of a newly
-  ## created file/directory for the user. To preserve attributes recursively on
-  ## these platforms use `copyDirWithPermissions() <#copyDirWithPermissions>`_.
+  ## If this fails, `OSError` is raised.
+  ##
+  ## On the Windows platform this proc will copy the attributes from
+  ## `source` into `dest`.
+  ##
+  ## On other platforms created files and directories will inherit the
+  ## default permissions of a newly created file/directory for the user.
+  ## Use `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## to preserve attributes recursively on these platforms.
+  ##
+  ## See also:
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `existsOrCreateDir proc <#existsOrCreateDir,string>`_
+  ## * `createDir proc <#createDir,string>`_
+  ## * `moveDir proc <#moveDir,string,string>`_
   createDir(dest)
   for kind, path in walkDir(source):
     var noSource = splitPath(path).tail
@@ -1701,6 +2368,24 @@ proc copyDir*(source, dest: string) {.rtl, extern: "nos$1",
       copyDir(path, dest / noSource)
     else: discard
 
+proc moveDir*(source, dest: string) {.tags: [ReadIOEffect, WriteIOEffect], noNimScript.} =
+  ## Moves a directory from `source` to `dest`.
+  ##
+  ## If this fails, `OSError` is raised.
+  ##
+  ## See also:
+  ## * `moveFile proc <#moveFile,string,string>`_
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `existsOrCreateDir proc <#existsOrCreateDir,string>`_
+  ## * `createDir proc <#createDir,string>`_
+  if not tryMoveFSObject(source, dest):
+    when not defined(windows):
+      # Fallback to copy & del
+      copyDir(source, dest)
+      removeDir(source)
+
 proc createSymlink*(src, dest: string) {.noNimScript.} =
   ## Create a symbolic link at `dest` which points to the item specified
   ## by `src`. On most operating systems, will fail if a link already exists.
@@ -1708,6 +2393,11 @@ proc createSymlink*(src, dest: string) {.noNimScript.} =
   ## **Warning**:
   ## Some OS's (such as Microsoft Windows) restrict the creation
   ## of symlinks to root users (administrators).
+  ##
+  ## See also:
+  ## * `createHardlink proc <#createHardlink,string,string>`_
+  ## * `expandSymlink proc <#expandSymlink,string>`_
+
   when defined(Windows):
     # 2 is the SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE. This allows
     # anyone with developer mode on to create a link
@@ -1716,13 +2406,13 @@ proc createSymlink*(src, dest: string) {.noNimScript.} =
       var wSrc = newWideCString(src)
       var wDst = newWideCString(dest)
       if createSymbolicLinkW(wDst, wSrc, flag) == 0 or getLastError() != 0:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), $(src, dest))
     else:
       if createSymbolicLinkA(dest, src, flag) == 0 or getLastError() != 0:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), $(src, dest))
   else:
     if symlink(src, dest) != 0:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), $(src, dest))
 
 proc createHardlink*(src, dest: string) {.noNimScript.} =
   ## Create a hard link at `dest` which points to the item specified
@@ -1730,26 +2420,144 @@ proc createHardlink*(src, dest: string) {.noNimScript.} =
   ##
   ## **Warning**: Some OS's restrict the creation of hard links to
   ## root users (administrators).
+  ##
+  ## See also:
+  ## * `createSymlink proc <#createSymlink,string,string>`_
   when defined(Windows):
     when useWinUnicode:
       var wSrc = newWideCString(src)
       var wDst = newWideCString(dest)
       if createHardLinkW(wDst, wSrc, nil) == 0:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), $(src, dest))
     else:
       if createHardLinkA(dest, src, nil) == 0:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), $(src, dest))
   else:
     if link(src, dest) != 0:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), $(src, dest))
+
+proc copyFileWithPermissions*(source, dest: string,
+                              ignorePermissionErrors = true) {.noNimScript.} =
+  ## Copies a file from `source` to `dest` preserving file permissions.
+  ##
+  ## This is a wrapper proc around `copyFile <#copyFile,string,string>`_,
+  ## `getFilePermissions <#getFilePermissions,string>`_ and
+  ## `setFilePermissions<#setFilePermissions,string,set[FilePermission]>`_
+  ## procs on non-Windows platforms.
+  ##
+  ## On Windows this proc is just a wrapper for `copyFile proc
+  ## <#copyFile,string,string>`_ since that proc already copies attributes.
+  ##
+  ## On non-Windows systems permissions are copied after the file itself has
+  ## been copied, which won't happen atomically and could lead to a race
+  ## condition. If `ignorePermissionErrors` is true (default), errors while
+  ## reading/setting file attributes will be ignored, otherwise will raise
+  ## `OSError`.
+  ##
+  ## See also:
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `tryRemoveFile proc <#tryRemoveFile,string>`_
+  ## * `removeFile proc <#removeFile,string>`_
+  ## * `moveFile proc <#moveFile,string,string>`_
+  ## * `copyDirWithPermissions proc <#copyDirWithPermissions,string,string>`_
+  copyFile(source, dest)
+  when not defined(Windows):
+    try:
+      setFilePermissions(dest, getFilePermissions(source))
+    except:
+      if not ignorePermissionErrors:
+        raise
+
+proc copyDirWithPermissions*(source, dest: string,
+    ignorePermissionErrors = true) {.rtl, extern: "nos$1",
+    tags: [WriteIOEffect, ReadIOEffect], benign, noNimScript.} =
+  ## Copies a directory from `source` to `dest` preserving file permissions.
+  ##
+  ## If this fails, `OSError` is raised. This is a wrapper proc around `copyDir
+  ## <#copyDir,string,string>`_ and `copyFileWithPermissions
+  ## <#copyFileWithPermissions,string,string>`_ procs
+  ## on non-Windows platforms.
+  ##
+  ## On Windows this proc is just a wrapper for `copyDir proc
+  ## <#copyDir,string,string>`_ since that proc already copies attributes.
+  ##
+  ## On non-Windows systems permissions are copied after the file or directory
+  ## itself has been copied, which won't happen atomically and could lead to a
+  ## race condition. If `ignorePermissionErrors` is true (default), errors while
+  ## reading/setting file attributes will be ignored, otherwise will raise
+  ## `OSError`.
+  ##
+  ## See also:
+  ## * `copyDir proc <#copyDir,string,string>`_
+  ## * `copyFile proc <#copyFile,string,string>`_
+  ## * `copyFileWithPermissions proc <#copyFileWithPermissions,string,string>`_
+  ## * `removeDir proc <#removeDir,string>`_
+  ## * `moveDir proc <#moveDir,string,string>`_
+  ## * `existsOrCreateDir proc <#existsOrCreateDir,string>`_
+  ## * `createDir proc <#createDir,string>`_
+  createDir(dest)
+  when not defined(Windows):
+    try:
+      setFilePermissions(dest, getFilePermissions(source))
+    except:
+      if not ignorePermissionErrors:
+        raise
+  for kind, path in walkDir(source):
+    var noSource = splitPath(path).tail
+    case kind
+    of pcFile:
+      copyFileWithPermissions(path, dest / noSource, ignorePermissionErrors)
+    of pcDir:
+      copyDirWithPermissions(path, dest / noSource, ignorePermissionErrors)
+    else: discard
+
+proc inclFilePermissions*(filename: string,
+                          permissions: set[FilePermission]) {.
+  rtl, extern: "nos$1", tags: [ReadDirEffect, WriteDirEffect], noNimScript.} =
+  ## A convenience proc for:
+  ##
+  ## .. code-block:: nim
+  ##   setFilePermissions(filename, getFilePermissions(filename)+permissions)
+  setFilePermissions(filename, getFilePermissions(filename)+permissions)
+
+proc exclFilePermissions*(filename: string,
+                          permissions: set[FilePermission]) {.
+  rtl, extern: "nos$1", tags: [ReadDirEffect, WriteDirEffect], noNimScript.} =
+  ## A convenience proc for:
+  ##
+  ## .. code-block:: nim
+  ##   setFilePermissions(filename, getFilePermissions(filename)-permissions)
+  setFilePermissions(filename, getFilePermissions(filename)-permissions)
+
+proc expandSymlink*(symlinkPath: string): string {.noNimScript.} =
+  ## Returns a string representing the path to which the symbolic link points.
+  ##
+  ## On Windows this is a noop, ``symlinkPath`` is simply returned.
+  ##
+  ## See also:
+  ## * `createSymlink proc <#createSymlink,string,string>`_
+  when defined(windows):
+    result = symlinkPath
+  else:
+    result = newString(256)
+    var len = readlink(symlinkPath, result, 256)
+    if len < 0:
+      raiseOSError(osLastError(), symlinkPath)
+    if len > 256:
+      result = newString(len+1)
+      len = readlink(symlinkPath, result, len)
+    setLen(result, len)
 
 proc parseCmdLine*(c: string): seq[string] {.
   noSideEffect, rtl, extern: "nos$1".} =
-  ## Splits a `command line`:idx: into several components;
-  ## This proc is only occasionally useful, better use the `parseopt` module.
+  ## Splits a `command line`:idx: into several components.
   ##
-  ## On Windows, it uses the following parsing rules
-  ## (see http://msdn.microsoft.com/en-us/library/17w5ykft.aspx ):
+  ## **Note**: This proc is only occasionally useful, better use the
+  ## `parseopt module <parseopt.html>`_.
+  ##
+  ## On Windows, it uses the `following parsing rules
+  ## <http://msdn.microsoft.com/en-us/library/17w5ykft.aspx>`_:
   ##
   ## * Arguments are delimited by white space, which is either a space or a tab.
   ## * The caret character (^) is not recognized as an escape character or
@@ -1774,6 +2582,13 @@ proc parseCmdLine*(c: string): seq[string] {.
   ## On Posix systems, it uses the following parsing rules:
   ## Components are separated by whitespace unless the whitespace
   ## occurs within ``"`` or ``'`` quotes.
+  ##
+  ## See also:
+  ## * `parseopt module <parseopt.html>`_
+  ## * `paramCount proc <#paramCount>`_
+  ## * `paramStr proc <#paramStr,int>`_
+  ## * `commandLineParams proc <#commandLineParams>`_
+
   result = @[]
   var i = 0
   var a = ""
@@ -1831,102 +2646,6 @@ proc parseCmdLine*(c: string): seq[string] {.
           inc(i)
     add(result, a)
 
-proc copyFileWithPermissions*(source, dest: string,
-                              ignorePermissionErrors = true) {.noNimScript.} =
-  ## Copies a file from `source` to `dest` preserving file permissions.
-  ##
-  ## This is a wrapper proc around `copyFile() <#copyFile>`_,
-  ## `getFilePermissions() <#getFilePermissions>`_ and `setFilePermissions()
-  ## <#setFilePermissions>`_ on non Windows platform. On Windows this proc is
-  ## just a wrapper for `copyFile() <#copyFile>`_ since that proc already
-  ## copies attributes.
-  ##
-  ## On non Windows systems permissions are copied after the file itself has
-  ## been copied, which won't happen atomically and could lead to a race
-  ## condition. If `ignorePermissionErrors` is true, errors while
-  ## reading/setting file attributes will be ignored, otherwise will raise
-  ## `OSError`.
-  copyFile(source, dest)
-  when not defined(Windows):
-    try:
-      setFilePermissions(dest, getFilePermissions(source))
-    except:
-      if not ignorePermissionErrors:
-        raise
-
-proc copyDirWithPermissions*(source, dest: string,
-    ignorePermissionErrors = true) {.rtl, extern: "nos$1",
-    tags: [WriteIOEffect, ReadIOEffect], benign, noNimScript.} =
-  ## Copies a directory from `source` to `dest` preserving file permissions.
-  ##
-  ## If this fails, `OSError` is raised. This is a wrapper proc around `copyDir()
-  ## <#copyDir>`_ and `copyFileWithPermissions() <#copyFileWithPermissions>`_
-  ## on non Windows platforms. On Windows this proc is just a wrapper for
-  ## `copyDir() <#copyDir>`_ since that proc already copies attributes.
-  ##
-  ## On non Windows systems permissions are copied after the file or directory
-  ## itself has been copied, which won't happen atomically and could lead to a
-  ## race condition. If `ignorePermissionErrors` is true, errors while
-  ## reading/setting file attributes will be ignored, otherwise will raise
-  ## `OSError`.
-  createDir(dest)
-  when not defined(Windows):
-    try:
-      setFilePermissions(dest, getFilePermissions(source))
-    except:
-      if not ignorePermissionErrors:
-        raise
-  for kind, path in walkDir(source):
-    var noSource = splitPath(path).tail
-    case kind
-    of pcFile:
-      copyFileWithPermissions(path, dest / noSource, ignorePermissionErrors)
-    of pcDir:
-      copyDirWithPermissions(path, dest / noSource, ignorePermissionErrors)
-    else: discard
-
-proc inclFilePermissions*(filename: string,
-                          permissions: set[FilePermission]) {.
-  rtl, extern: "nos$1", tags: [ReadDirEffect, WriteDirEffect], noNimScript.} =
-  ## a convenience procedure for:
-  ##
-  ## .. code-block:: nim
-  ##   setFilePermissions(filename, getFilePermissions(filename)+permissions)
-  setFilePermissions(filename, getFilePermissions(filename)+permissions)
-
-proc exclFilePermissions*(filename: string,
-                          permissions: set[FilePermission]) {.
-  rtl, extern: "nos$1", tags: [ReadDirEffect, WriteDirEffect], noNimScript.} =
-  ## a convenience procedure for:
-  ##
-  ## .. code-block:: nim
-  ##   setFilePermissions(filename, getFilePermissions(filename)-permissions)
-  setFilePermissions(filename, getFilePermissions(filename)-permissions)
-
-proc moveDir*(source, dest: string) {.tags: [ReadIOEffect, WriteIOEffect], noNimScript.} =
-  ## Moves a directory from `source` to `dest`. If this fails, `OSError` is raised.
-  if not tryMoveFSObject(source, dest):
-    when not defined(windows):
-      # Fallback to copy & del
-      copyDir(source, dest)
-      removeDir(source)
-
-proc expandSymlink*(symlinkPath: string): string {.noNimScript.} =
-  ## Returns a string representing the path to which the symbolic link points.
-  ##
-  ## On Windows this is a noop, ``symlinkPath`` is simply returned.
-  when defined(windows):
-    result = symlinkPath
-  else:
-    result = newString(256)
-    var len = readlink(symlinkPath, result, 256)
-    if len < 0:
-      raiseOSError(osLastError())
-    if len > 256:
-      result = newString(len+1)
-      len = readlink(symlinkPath, result, len)
-    setLen(result, len)
-
 when defined(nimdoc):
   # Common forward declaration docstring block for parameter retrieval procs.
   proc paramCount*(): int {.tags: [ReadIOEffect].} =
@@ -1935,14 +2654,21 @@ when defined(nimdoc):
     ##
     ## Unlike `argc`:idx: in C, if your binary was called without parameters this
     ## will return zero.
-    ## You can query each individual paramater with `paramStr() <#paramStr>`_
-    ## or retrieve all of them in one go with `commandLineParams()
+    ## You can query each individual parameter with `paramStr proc <#paramStr,int>`_
+    ## or retrieve all of them in one go with `commandLineParams proc
     ## <#commandLineParams>`_.
     ##
-    ## **Availability**: When generating a dynamic library (see --app:lib) on
+    ## **Availability**: When generating a dynamic library (see `--app:lib`) on
     ## Posix this proc is not defined.
-    ## Test for availability using `declared() <system.html#declared>`_.
-    ## Example:
+    ## Test for availability using `declared() <system.html#declared,untyped>`_.
+    ##
+    ## See also:
+    ## * `parseopt module <parseopt.html>`_
+    ## * `parseCmdLine proc <#parseCmdLine,string>`_
+    ## * `paramStr proc <#paramStr,int>`_
+    ## * `commandLineParams proc <#commandLineParams>`_
+    ##
+    ## **Examples:**
     ##
     ## .. code-block:: nim
     ##   when declared(paramCount):
@@ -1953,7 +2679,7 @@ when defined(nimdoc):
   proc paramStr*(i: int): TaintedString {.tags: [ReadIOEffect].} =
     ## Returns the `i`-th `command line argument`:idx: given to the application.
     ##
-    ## `i` should be in the range `1..paramCount()`, the `IndexError`
+    ## `i` should be in the range `1..paramCount()`, the `IndexDefect`
     ## exception will be raised for invalid values.  Instead of iterating over
     ## `paramCount() <#paramCount>`_ with this proc you can call the
     ## convenience `commandLineParams() <#commandLineParams>`_.
@@ -1963,10 +2689,18 @@ when defined(nimdoc):
     ## contents (usually the name of the invoked executable). You should avoid
     ## this and call `getAppFilename() <#getAppFilename>`_ instead.
     ##
-    ## **Availability**: When generating a dynamic library (see --app:lib) on
+    ## **Availability**: When generating a dynamic library (see `--app:lib`) on
     ## Posix this proc is not defined.
-    ## Test for availability using `declared() <system.html#declared>`_.
-    ## Example:
+    ## Test for availability using `declared() <system.html#declared,untyped>`_.
+    ##
+    ## See also:
+    ## * `parseopt module <parseopt.html>`_
+    ## * `parseCmdLine proc <#parseCmdLine,string>`_
+    ## * `paramCount proc <#paramCount>`_
+    ## * `commandLineParams proc <#commandLineParams>`_
+    ## * `getAppFilename proc <#getAppFilename>`_
+    ##
+    ## **Examples:**
     ##
     ## .. code-block:: nim
     ##   when declared(paramStr):
@@ -1974,7 +2708,23 @@ when defined(nimdoc):
     ##   else:
     ##     # Do something else!
 
-elif defined(nintendoswitch) or weirdTarget:
+elif defined(nimscript):
+  proc paramStr*(i: int): string =
+    ## Retrieves the ``i``'th command line parameter.
+    discard
+
+  proc paramCount*(): int =
+    ## Retrieves the number of command line parameters.
+    discard
+
+elif defined(js):
+  proc paramStr*(i: int): TaintedString {.tags: [ReadIOEffect].} =
+    raise newException(OSError, "paramStr is not implemented on JavaScript")
+
+  proc paramCount*(): int {.tags: [ReadIOEffect].} =
+    raise newException(OSError, "paramCount is not implemented on JavaScript")
+
+elif defined(nintendoswitch):
   proc paramStr*(i: int): TaintedString {.tags: [ReadIOEffect].} =
     raise newException(OSError, "paramStr is not implemented on Nintendo Switch")
 
@@ -2005,7 +2755,7 @@ elif defined(windows):
       ownArgv = parseCmdLine($getCommandLine())
       ownParsedArgv = true
     if i < ownArgv.len and i >= 0: return TaintedString(ownArgv[i])
-    raise newException(IndexError, "invalid index")
+    raise newException(IndexDefect, formatErrorIndexBound(i, ownArgv.len-1))
 
 elif defined(genode):
   proc paramStr*(i: int): TaintedString =
@@ -2024,7 +2774,7 @@ elif not defined(createNimRtl) and
   proc paramStr*(i: int): TaintedString {.tags: [ReadIOEffect].} =
     # Docstring in nimdoc block.
     if i < cmdCount and i >= 0: return TaintedString($cmdLine[i])
-    raise newException(IndexError, "invalid index")
+    raise newException(IndexDefect, formatErrorIndexBound(i, cmdCount-1))
 
   proc paramCount*(): int {.tags: [ReadIOEffect].} =
     # Docstring in nimdoc block.
@@ -2039,8 +2789,17 @@ when declared(paramCount) or defined(nimdoc):
     ##
     ## **Availability**: On Posix there is no portable way to get the command
     ## line from a DLL and thus the proc isn't defined in this environment. You
-    ## can test for its availability with `declared() <system.html#declared>`_.
-    ## Example:
+    ## can test for its availability with `declared()
+    ## <system.html#declared,untyped>`_.
+    ##
+    ## See also:
+    ## * `parseopt module <parseopt.html>`_
+    ## * `parseCmdLine proc <#parseCmdLine,string>`_
+    ## * `paramCount proc <#paramCount>`_
+    ## * `paramStr proc <#paramStr,int>`_
+    ## * `getAppFilename proc <#getAppFilename>`_
+    ##
+    ## **Examples:**
     ##
     ## .. code-block:: nim
     ##   when declared(commandLineParams):
@@ -2050,10 +2809,14 @@ when declared(paramCount) or defined(nimdoc):
     result = @[]
     for i in 1..paramCount():
       result.add(paramStr(i))
+else:
+  proc commandLineParams*(): seq[TaintedString] {.error:
+  "commandLineParams() unsupported by dynamic libraries".} =
+    discard
 
 when not weirdTarget and (defined(freebsd) or defined(dragonfly)):
-  proc sysctl(name: ptr cint, namelen: cuint, oldp: pointer, oldplen: ptr csize,
-              newp: pointer, newplen: csize): cint
+  proc sysctl(name: ptr cint, namelen: cuint, oldp: pointer, oldplen: ptr csize_t,
+              newp: pointer, newplen: csize_t): cint
        {.importc: "sysctl",header: """#include <sys/types.h>
                                       #include <sys/sysctl.h>"""}
   const
@@ -2067,22 +2830,23 @@ when not weirdTarget and (defined(freebsd) or defined(dragonfly)):
     const KERN_PROC_PATHNAME = 9
 
   proc getApplFreebsd(): string =
-    var pathLength = csize(MAX_PATH)
-    result = newString(pathLength)
+    var pathLength = csize_t(0)
     var req = [CTL_KERN.cint, KERN_PROC.cint, KERN_PROC_PATHNAME.cint, -1.cint]
-    while true:
-      let res = sysctl(addr req[0], 4, cast[pointer](addr result[0]),
-                       addr pathLength, nil, 0)
-      if res < 0:
-        let err = osLastError()
-        if err.int32 == ENOMEM:
-          result = newString(pathLength)
-        else:
-          result.setLen(0) # error!
-          break
-      else:
-        result.setLen(pathLength)
-        break
+
+    # first call to get the required length
+    var res = sysctl(addr req[0], 4, nil, addr pathLength, nil, 0)
+
+    if res < 0:
+      return ""
+
+    result.setLen(pathLength)
+    res = sysctl(addr req[0], 4, addr result[0], addr pathLength, nil, 0)
+
+    if res < 0:
+      return ""
+
+    let realLen = len(cstring(result))
+    setLen(result, realLen)
 
 when not weirdTarget and (defined(linux) or defined(solaris) or defined(bsd) or defined(aix)):
   proc getApplAux(procPath: string): string =
@@ -2092,6 +2856,40 @@ when not weirdTarget and (defined(linux) or defined(solaris) or defined(bsd) or 
       result = newString(len+1)
       len = readlink(procPath, result, len)
     setLen(result, len)
+
+when not weirdTarget and defined(openbsd):
+  proc getApplOpenBsd(): string =
+    # similar to getApplHeuristic, but checks current working directory
+    when declared(paramStr):
+      result = ""
+
+      # POSIX guaranties that this contains the executable
+      # as it has been executed by the calling process
+      let exePath = string(paramStr(0))
+
+      if len(exePath) == 0:
+        return ""
+
+      if exePath[0] == DirSep:
+        # path is absolute
+        result = exePath
+      else:
+        # not an absolute path, check if it's relative to the current working directory
+        for i in 1..<len(exePath):
+          if exePath[i] == DirSep:
+            result = joinPath(getCurrentDir(), exePath)
+            break
+
+      if len(result) > 0:
+        return expandFilename(result)
+
+      # search in path
+      for p in split(string(getEnv("PATH")), {PathSep}):
+        var x = joinPath(p, exePath)
+        if existsFile(x):
+          return expandFilename(x)
+    else:
+      result = ""
 
 when not (defined(windows) or defined(macosx) or weirdTarget):
   proc getApplHeuristic(): string =
@@ -2138,10 +2936,12 @@ when defined(haiku):
       result = ""
 
 proc getAppFilename*(): string {.rtl, extern: "nos$1", tags: [ReadIOEffect], noNimScript.} =
-  ## Returns the filename of the application's executable. See also
-  ## `getCurrentCompilerExe`.
+  ## Returns the filename of the application's executable.
+  ## This proc will resolve symlinks.
   ##
-  ## This procedure will resolve symlinks.
+  ## See also:
+  ## * `getAppDir proc <#getAppDir>`_
+  ## * `getCurrentCompilerExe proc <#getCurrentCompilerExe>`_
 
   # Linux: /proc/<pid>/exe
   # Solaris:
@@ -2194,16 +2994,22 @@ proc getAppFilename*(): string {.rtl, extern: "nos$1", tags: [ReadIOEffect], noN
       result = getApplFreebsd()
     elif defined(haiku):
       result = getApplHaiku()
+    elif defined(openbsd):
+      result = getApplOpenBsd()
+
     # little heuristic that may work on other POSIX-like systems:
     if result.len == 0:
       result = getApplHeuristic()
 
 proc getAppDir*(): string {.rtl, extern: "nos$1", tags: [ReadIOEffect], noNimScript.} =
   ## Returns the directory of the application's executable.
+  ##
+  ## See also:
+  ## * `getAppFilename proc <#getAppFilename>`_
   result = splitFile(getAppFilename()).dir
 
 proc sleep*(milsecs: int) {.rtl, extern: "nos$1", tags: [TimeEffect], noNimScript.} =
-  ## sleeps `milsecs` milliseconds.
+  ## Sleeps `milsecs` milliseconds.
   when defined(windows):
     winlean.sleep(int32(milsecs))
   else:
@@ -2214,12 +3020,12 @@ proc sleep*(milsecs: int) {.rtl, extern: "nos$1", tags: [TimeEffect], noNimScrip
 
 proc getFileSize*(file: string): BiggestInt {.rtl, extern: "nos$1",
   tags: [ReadIOEffect], noNimScript.} =
-  ## returns the file size of `file` (in bytes). An ``OSError`` exception is
+  ## Returns the file size of `file` (in bytes). ``OSError`` is
   ## raised in case of an error.
   when defined(windows):
     var a: WIN32_FIND_DATA
     var resA = findFirstFile(file, a)
-    if resA == -1: raiseOSError(osLastError())
+    if resA == -1: raiseOSError(osLastError(), file)
     result = rdFileSize(a)
     findClose(resA)
   else:
@@ -2227,7 +3033,7 @@ proc getFileSize*(file: string): BiggestInt {.rtl, extern: "nos$1",
     if open(f, file):
       result = getFileSize(f)
       close(f)
-    else: raiseOSError(osLastError())
+    else: raiseOSError(osLastError(), file)
 
 when defined(Windows) or weirdTarget:
   type
@@ -2241,14 +3047,19 @@ else:
 type
   FileInfo* = object
     ## Contains information associated with a file object.
-    id*: tuple[device: DeviceId, file: FileId] # Device and file id.
-    kind*: PathComponent # Kind of file object - directory, symlink, etc.
-    size*: BiggestInt # Size of file.
-    permissions*: set[FilePermission] # File permissions
-    linkCount*: BiggestInt # Number of hard links the file object has.
-    lastAccessTime*: times.Time # Time file was last accessed.
-    lastWriteTime*: times.Time # Time file was last modified/written to.
-    creationTime*: times.Time # Time file was created. Not supported on all systems!
+    ##
+    ## See also:
+    ## * `getFileInfo(handle) proc <#getFileInfo,FileHandle>`_
+    ## * `getFileInfo(file) proc <#getFileInfo,File>`_
+    ## * `getFileInfo(path) proc <#getFileInfo,string>`_
+    id*: tuple[device: DeviceId, file: FileId] ## Device and file id.
+    kind*: PathComponent              ## Kind of file object - directory, symlink, etc.
+    size*: BiggestInt                 ## Size of file.
+    permissions*: set[FilePermission] ## File permissions
+    linkCount*: BiggestInt            ## Number of hard links the file object has.
+    lastAccessTime*: times.Time       ## Time file was last accessed.
+    lastWriteTime*: times.Time        ## Time file was last modified/written to.
+    creationTime*: times.Time         ## Time file was created. Not supported on all systems!
 
 template rawToFormalFileInfo(rawInfo, path, formalInfo): untyped =
   ## Transforms the native file info structure into the one nim uses.
@@ -2280,11 +3091,11 @@ template rawToFormalFileInfo(rawInfo, path, formalInfo): untyped =
 
   else:
     template checkAndIncludeMode(rawMode, formalMode: untyped) =
-      if (rawInfo.st_mode and rawMode) != 0'i32:
+      if (rawInfo.st_mode and rawMode.Mode) != 0.Mode:
         formalInfo.permissions.incl(formalMode)
     formalInfo.id = (rawInfo.st_dev, rawInfo.st_ino)
     formalInfo.size = rawInfo.st_size
-    formalInfo.linkCount = rawInfo.st_Nlink.BiggestInt
+    formalInfo.linkCount = rawInfo.st_nlink.BiggestInt
     formalInfo.lastAccessTime = rawInfo.st_atim.toTime
     formalInfo.lastWriteTime = rawInfo.st_mtim.toTime
     formalInfo.creationTime = rawInfo.st_ctim.toTime
@@ -2309,7 +3120,7 @@ template rawToFormalFileInfo(rawInfo, path, formalInfo): untyped =
       assert(path != "") # symlinks can't occur for file handles
       formalInfo.kind = getSymlinkFileKind(path)
 
-when defined(js):
+when defined(js) or defined(nimscript):
   when not declared(FileHandle):
     type FileHandle = distinct int32
   when not declared(File):
@@ -2320,23 +3131,33 @@ proc getFileInfo*(handle: FileHandle): FileInfo {.noNimScript.} =
   ## handle.
   ##
   ## If the information cannot be retrieved, such as when the file handle
-  ## is invalid, an error will be thrown.
+  ## is invalid, `OSError` is raised.
+  ##
+  ## See also:
+  ## * `getFileInfo(file) proc <#getFileInfo,File>`_
+  ## * `getFileInfo(path) proc <#getFileInfo,string>`_
+
   # Done: ID, Kind, Size, Permissions, Link Count
   when defined(Windows):
     var rawInfo: BY_HANDLE_FILE_INFORMATION
     # We have to use the super special '_get_osfhandle' call (wrapped above)
-    # To transform the C file descripter to a native file handle.
+    # To transform the C file descriptor to a native file handle.
     var realHandle = get_osfhandle(handle)
     if getFileInformationByHandle(realHandle, addr rawInfo) == 0:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), $handle)
     rawToFormalFileInfo(rawInfo, "", result)
   else:
     var rawInfo: Stat
     if fstat(handle, rawInfo) < 0'i32:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), $handle)
     rawToFormalFileInfo(rawInfo, "", result)
 
 proc getFileInfo*(file: File): FileInfo {.noNimScript.} =
+  ## Retrieves file information for the file object.
+  ##
+  ## See also:
+  ## * `getFileInfo(handle) proc <#getFileInfo,FileHandle>`_
+  ## * `getFileInfo(path) proc <#getFileInfo,string>`_
   if file.isNil:
     raise newException(IOError, "File is nil")
   result = getFileInfo(file.getFileHandle())
@@ -2345,52 +3166,58 @@ proc getFileInfo*(path: string, followSymlink = true): FileInfo {.noNimScript.} 
   ## Retrieves file information for the file object pointed to by `path`.
   ##
   ## Due to intrinsic differences between operating systems, the information
-  ## contained by the returned `FileInfo` structure will be slightly different
-  ## across platforms, and in some cases, incomplete or inaccurate.
+  ## contained by the returned `FileInfo object <#FileInfo>`_ will be slightly
+  ## different across platforms, and in some cases, incomplete or inaccurate.
   ##
-  ## When `followSymlink` is true, symlinks are followed and the information
-  ## retrieved is information related to the symlink's target. Otherwise,
-  ## information on the symlink itself is retrieved.
+  ## When `followSymlink` is true (default), symlinks are followed and the
+  ## information retrieved is information related to the symlink's target.
+  ## Otherwise, information on the symlink itself is retrieved.
   ##
   ## If the information cannot be retrieved, such as when the path doesn't
   ## exist, or when permission restrictions prevent the program from retrieving
-  ## file information, an error will be thrown.
+  ## file information, `OSError` is raised.
+  ##
+  ## See also:
+  ## * `getFileInfo(handle) proc <#getFileInfo,FileHandle>`_
+  ## * `getFileInfo(file) proc <#getFileInfo,File>`_
   when defined(Windows):
     var
       handle = openHandle(path, followSymlink)
       rawInfo: BY_HANDLE_FILE_INFORMATION
     if handle == INVALID_HANDLE_VALUE:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), path)
     if getFileInformationByHandle(handle, addr rawInfo) == 0:
-      raiseOSError(osLastError())
+      raiseOSError(osLastError(), path)
     rawToFormalFileInfo(rawInfo, path, result)
     discard closeHandle(handle)
   else:
     var rawInfo: Stat
     if followSymlink:
       if stat(path, rawInfo) < 0'i32:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), path)
     else:
       if lstat(path, rawInfo) < 0'i32:
-        raiseOSError(osLastError())
+        raiseOSError(osLastError(), path)
     rawToFormalFileInfo(rawInfo, path, result)
 
 proc isHidden*(path: string): bool {.noNimScript.} =
-  ## Determines whether ``path`` is hidden or not, using this
-  ## reference https://en.wikipedia.org/wiki/Hidden_file_and_hidden_directory
+  ## Determines whether ``path`` is hidden or not, using `this
+  ## reference <https://en.wikipedia.org/wiki/Hidden_file_and_hidden_directory>`_.
   ##
   ## On Windows: returns true if it exists and its "hidden" attribute is set.
   ##
   ## On posix: returns true if ``lastPathPart(path)`` starts with ``.`` and is
-  ## not ``.`` or ``..``. Note: paths are not normalized to determine `isHidden`.
+  ## not ``.`` or ``..``.
+  ##
+  ## **Note**: paths are not normalized to determine `isHidden`.
   runnableExamples:
     when defined(posix):
-      doAssert ".foo".isHidden
-      doAssert: not ".foo/bar".isHidden
-      doAssert: not ".".isHidden
-      doAssert: not "..".isHidden
-      doAssert: not "".isHidden
-      doAssert ".foo/".isHidden
+      assert ".foo".isHidden
+      assert not ".foo/bar".isHidden
+      assert not ".".isHidden
+      assert not "..".isHidden
+      assert not "".isHidden
+      assert ".foo/".isHidden
 
   when defined(Windows):
     when useWinUnicode:
@@ -2404,15 +3231,16 @@ proc isHidden*(path: string): bool {.noNimScript.} =
     result = len(fileName) >= 2 and fileName[0] == '.' and fileName != ".."
 
 proc getCurrentProcessId*(): int {.noNimScript.} =
-  ## return current process ID. See also ``osproc.processID(p: Process)``.
+  ## Return current process ID.
+  ##
+  ## See also:
+  ## * `osproc.processID(p: Process) <osproc.html#processID,Process>`_
   when defined(windows):
     proc GetCurrentProcessId(): DWORD {.stdcall, dynlib: "kernel32",
                                         importc: "GetCurrentProcessId".}
     result = GetCurrentProcessId().int
   else:
     result = getpid()
-
-{.pop.}
 
 proc setLastModificationTime*(file: string, t: times.Time) {.noNimScript.} =
   ## Sets the `file`'s last modification time. `OSError` is raised in case of
@@ -2422,14 +3250,41 @@ proc setLastModificationTime*(file: string, t: times.Time) {.noNimScript.} =
     let micro = convert(Nanoseconds, Microseconds, t.nanosecond)
     var timevals = [Timeval(tv_sec: unixt, tv_usec: micro),
       Timeval(tv_sec: unixt, tv_usec: micro)] # [last access, last modification]
-    if utimes(file, timevals.addr) != 0: raiseOSError(osLastError())
+    if utimes(file, timevals.addr) != 0: raiseOSError(osLastError(), file)
   else:
     let h = openHandle(path = file, writeAccess = true)
-    if h == INVALID_HANDLE_VALUE: raiseOSError(osLastError())
+    if h == INVALID_HANDLE_VALUE: raiseOSError(osLastError(), file)
     var ft = t.toWinTime.toFILETIME
     let res = setFileTime(h, nil, nil, ft.addr)
     discard h.closeHandle
-    if res == 0'i32: raiseOSError(osLastError())
+    if res == 0'i32: raiseOSError(osLastError(), file)
+
+func isValidFilename*(filename: string, maxLen = 259.Positive): bool {.since: (1, 1).} =
+  ## Returns true if ``filename`` is valid for crossplatform use.
+  ##
+  ## This is useful if you want to copy or save files across Windows, Linux, Mac, etc.
+  ## You can pass full paths as argument too, but func only checks filenames.
+  ## It uses ``invalidFilenameChars``, ``invalidFilenames`` and ``maxLen`` to verify the specified ``filename``.
+  ##
+  ## .. code-block:: nim
+  ##   assert not isValidFilename(" foo")    ## Leading white space
+  ##   assert not isValidFilename("foo ")    ## Trailing white space
+  ##   assert not isValidFilename("foo.")    ## Ends with Dot
+  ##   assert not isValidFilename("con.txt") ## "CON" is invalid (Windows)
+  ##   assert not isValidFilename("OwO:UwU") ## ":" is invalid (Mac)
+  ##   assert not isValidFilename("aux.bat") ## "AUX" is invalid (Windows)
+  ##
+  # https://docs.microsoft.com/en-us/dotnet/api/system.io.pathtoolongexception
+  # https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+  # https://msdn.microsoft.com/en-us/library/windows/desktop/aa365247%28v=vs.85%29.aspx
+  result = true
+  let f = filename.splitFile()
+  if unlikely(f.name.len + f.ext.len > maxLen or
+    f.name[0] == ' ' or f.name[^1] == ' ' or f.name[^1] == '.' or
+    find(f.name, invalidFilenameChars) != -1): return false
+  for invalid in invalidFilenames:
+    if cmpIgnoreCase(f.name, invalid) == 0: return false
+
 
 when isMainModule:
   assert quoteShellWindows("aaa") == "aaa"
@@ -2464,3 +3319,31 @@ when isMainModule:
       doAssert r"D:\".normalizePathEnd == r"D:"
       doAssert r"E:/".normalizePathEnd(trailingSep = true) == r"E:\"
       doAssert "/".normalizePathEnd == r"\"
+
+
+  block isValidFilenameTest:
+    # Negative Tests.
+    doAssert not isValidFilename("abcd", maxLen = 2)
+    doAssert not isValidFilename("0123456789", maxLen = 8)
+    doAssert not isValidFilename("con")
+    doAssert not isValidFilename("aux")
+    doAssert not isValidFilename("prn")
+    doAssert not isValidFilename("OwO|UwU")
+    doAssert not isValidFilename(" foo")
+    doAssert not isValidFilename("foo ")
+    doAssert not isValidFilename("foo.")
+    doAssert not isValidFilename("con.txt")
+    doAssert not isValidFilename("aux.bat")
+    doAssert not isValidFilename("prn.exe")
+    doAssert not isValidFilename("nim>.nim")
+    doAssert not isValidFilename(" foo.log")
+    # Positive Tests.
+    doAssert isValidFilename("abcd", maxLen = 42.Positive)
+    doAssert isValidFilename("c0n")
+    doAssert isValidFilename("foo.aux")
+    doAssert isValidFilename("bar.prn")
+    doAssert isValidFilename("OwO_UwU")
+    doAssert isValidFilename("cron")
+    doAssert isValidFilename("ux.bat")
+    doAssert isValidFilename("nim.nim")
+    doAssert isValidFilename("foo.log")

@@ -10,11 +10,8 @@
 ## This module contains the data structures for the semantic checking phase.
 
 import
-  strutils, intsets, options, lexer, ast, astalgo, trees, treetab,
-  wordrecg,
-  ropes, msgs, platform, os, condsyms, idents, renderer, types, extccomp, math,
-  magicsys, nversion, nimsets, parser, times, passes, vmdef,
-  modulegraphs, lineinfos
+  intsets, options, ast, astalgo, msgs, idents, renderer,
+  magicsys, vmdef, modulegraphs, lineinfos, sets
 
 type
   TOptionEntry* = object      # entries to put on a stack for pragma parsing
@@ -24,6 +21,7 @@ type
     notes*: TNoteKinds
     features*: set[Feature]
     otherPragmas*: PNode      # every pragma can be pushed
+    warningAsErrors*: TNoteKinds
 
   POptionEntry* = ref TOptionEntry
   PProcCon* = ref TProcCon
@@ -40,6 +38,7 @@ type
     wasForwarded*: bool       # whether the current proc has a separate header
     mappingExists*: bool
     mapping*: TIdTable
+    caseContext*: seq[tuple[n: PNode, idx: int]]
 
   TMatchedConcept* = object
     candidateType*: PType
@@ -65,21 +64,16 @@ type
       # to the user.
     efWantStmt, efAllowStmt, efDetermineType, efExplain,
     efAllowDestructor, efWantValue, efOperand, efNoSemCheck,
-    efNoEvaluateGeneric, efInCall, efFromHlo,
+    efNoEvaluateGeneric, efInCall, efFromHlo, efNoSem2Check,
     efNoUndeclared
       # Use this if undeclared identifiers should not raise an error during
       # overload resolution.
 
   TExprFlags* = set[TExprFlag]
 
-  TTypeAttachedOp* = enum
-    attachedAsgn,
-    attachedSink,
-    attachedDeepCopy,
-    attachedDestructor
-
   PContext* = ref TContext
-  TContext* = object of TPassContext # a context represents a module
+  TContext* = object of TPassContext # a context represents the module
+                                     # that is currently being compiled
     enforceVoidContext*: PType
     module*: PSym              # the module sym belonging to the context
     currentScope*: PScope      # current scope
@@ -110,6 +104,9 @@ type
     semExpr*: proc (c: PContext, n: PNode, flags: TExprFlags = {}): PNode {.nimcall.}
     semTryExpr*: proc (c: PContext, n: PNode, flags: TExprFlags = {}): PNode {.nimcall.}
     semTryConstExpr*: proc (c: PContext, n: PNode): PNode {.nimcall.}
+    computeRequiresInit*: proc (c: PContext, t: PType): bool {.nimcall.}
+    hasUnresolvedArgs*: proc (c: PContext, n: PNode): bool
+
     semOperand*: proc (c: PContext, n: PNode, flags: TExprFlags = {}): PNode {.nimcall.}
     semConstBoolExpr*: proc (c: PContext, n: PNode): PNode {.nimcall.} # XXX bite the bullet
     semOverloadedCall*: proc (c: PContext, n, nOrig: PNode,
@@ -144,6 +141,8 @@ type
       # the generic type has been constructed completely. See
       # tests/destructor/topttree.nim for an example that
       # would otherwise fail.
+    unusedImports*: seq[(PSym, TLineInfo)]
+    exportIndirections*: HashSet[(int, int)]
 
 template config*(c: PContext): ConfigRef = c.graph.config
 
@@ -167,11 +166,10 @@ proc getCurrOwner*(c: PContext): PSym =
   result = c.graph.owners[^1]
 
 proc pushOwner*(c: PContext; owner: PSym) =
-  add(c.graph.owners, owner)
+  c.graph.owners.add(owner)
 
 proc popOwner*(c: PContext) =
-  var length = len(c.graph.owners)
-  if length > 0: setLen(c.graph.owners, length - 1)
+  if c.graph.owners.len > 0: setLen(c.graph.owners, c.graph.owners.len - 1)
   else: internalError(c.config, "popOwner")
 
 proc lastOptionEntry*(c: PContext): POptionEntry =
@@ -208,7 +206,7 @@ proc considerGenSyms*(c: PContext; n: PNode) =
       n.sym = s
   else:
     for i in 0..<n.safeLen:
-      considerGenSyms(c, n.sons[i])
+      considerGenSyms(c, n[i])
 
 proc newOptionEntry*(conf: ConfigRef): POptionEntry =
   new(result)
@@ -216,14 +214,32 @@ proc newOptionEntry*(conf: ConfigRef): POptionEntry =
   result.defaultCC = ccDefault
   result.dynlib = nil
   result.notes = conf.notes
+  result.warningAsErrors = conf.warningAsErrors
+
+proc pushOptionEntry*(c: PContext): POptionEntry =
+  new(result)
+  var prev = c.optionStack[^1]
+  result.options = c.config.options
+  result.defaultCC = prev.defaultCC
+  result.dynlib = prev.dynlib
+  result.notes = c.config.notes
+  result.warningAsErrors = c.config.warningAsErrors
+  result.features = c.features
+  c.optionStack.add(result)
+
+proc popOptionEntry*(c: PContext) =
+  c.config.options = c.optionStack[^1].options
+  c.config.notes = c.optionStack[^1].notes
+  c.config.warningAsErrors = c.optionStack[^1].warningAsErrors
+  c.features = c.optionStack[^1].features
+  c.optionStack.setLen(c.optionStack.len - 1)
 
 proc newContext*(graph: ModuleGraph; module: PSym): PContext =
   new(result)
-  result.enforceVoidContext = PType(kind: tyStmt)
+  result.enforceVoidContext = PType(kind: tyTyped)
   result.ambiguousSymbols = initIntSet()
-  result.optionStack = @[]
+  result.optionStack = @[newOptionEntry(graph.config)]
   result.libs = @[]
-  result.optionStack.add(newOptionEntry(graph.config))
   result.module = module
   result.friendModules = @[module]
   result.converters = @[]
@@ -240,11 +256,9 @@ proc newContext*(graph: ModuleGraph; module: PSym): PContext =
   result.features = graph.config.features
 
 proc inclSym(sq: var seq[PSym], s: PSym) =
-  var L = len(sq)
-  for i in countup(0, L - 1):
+  for i in 0..<sq.len:
     if sq[i].id == s.id: return
-  setLen(sq, L + 1)
-  sq[L] = s
+  sq.add s
 
 proc addConverter*(c: PContext, conv: PSym) =
   inclSym(c.converters, conv)
@@ -264,9 +278,12 @@ proc addToLib*(lib: PLib, sym: PSym) =
 proc newTypeS*(kind: TTypeKind, c: PContext): PType =
   result = newType(kind, getCurrOwner(c))
 
-proc makePtrType*(c: PContext, baseType: PType): PType =
-  result = newTypeS(tyPtr, c)
+proc makePtrType*(owner: PSym, baseType: PType): PType =
+  result = newType(tyPtr, owner)
   addSonSkipIntLit(result, baseType)
+
+proc makePtrType*(c: PContext, baseType: PType): PType =
+  makePtrType(getCurrOwner(c), baseType)
 
 proc makeTypeWithModifier*(c: PContext,
                            modifier: TTypeKind,
@@ -286,16 +303,26 @@ proc makeVarType*(c: PContext, baseType: PType; kind = tyVar): PType =
     result = newTypeS(kind, c)
     addSonSkipIntLit(result, baseType)
 
+proc makeVarType*(owner: PSym, baseType: PType; kind = tyVar): PType =
+  if baseType.kind == kind:
+    result = baseType
+  else:
+    result = newType(kind, owner)
+    addSonSkipIntLit(result, baseType)
+
 proc makeTypeDesc*(c: PContext, typ: PType): PType =
   if typ.kind == tyTypeDesc:
     result = typ
   else:
     result = newTypeS(tyTypeDesc, c)
+    incl result.flags, tfCheckedForDestructor
     result.addSonSkipIntLit(typ)
 
 proc makeTypeSymNode*(c: PContext, typ: PType, info: TLineInfo): PNode =
   let typedesc = newTypeS(tyTypeDesc, c)
-  typedesc.addSonSkipIntLit(assertNotNil(c.config, typ))
+  incl typedesc.flags, tfCheckedForDestructor
+  internalAssert(c.config, typ != nil)
+  typedesc.addSonSkipIntLit(typ)
   let sym = newSym(skType, c.cache.idAnon, getCurrOwner(c), info,
                    c.config.options).linkTo(typedesc)
   return newSymNode(sym, info)
@@ -364,7 +391,7 @@ proc makeRangeWithStaticExpr*(c: PContext, n: PNode): PType =
   if n.typ != nil and n.typ.n == nil:
     result.flags.incl tfUnresolved
   result.n = newNode(nkRange, n.info, @[
-    newIntTypeNode(nkIntLit, 0, intType),
+    newIntTypeNode(0, intType),
     makeStaticExpr(c, nMinusOne(c, n))])
 
 template rangeHasUnresolvedStatic*(t: PType): bool =
@@ -373,6 +400,7 @@ template rangeHasUnresolvedStatic*(t: PType): bool =
 proc errorType*(c: PContext): PType =
   ## creates a type representing an error state
   result = newTypeS(tyError, c)
+  result.flags.incl tfCheckedForDestructor
 
 proc errorNode*(c: PContext, n: PNode): PNode =
   result = newNodeI(nkEmpty, n.info)
@@ -387,8 +415,8 @@ proc makeRangeType*(c: PContext; first, last: BiggestInt;
                     info: TLineInfo; intType: PType = nil): PType =
   let intType = if intType != nil: intType else: getSysType(c.graph, info, tyInt)
   var n = newNodeI(nkRange, info)
-  addSon(n, newIntTypeNode(nkIntLit, first, intType))
-  addSon(n, newIntTypeNode(nkIntLit, last, intType))
+  n.add newIntTypeNode(first, intType)
+  n.add newIntTypeNode(last, intType)
   result = newTypeS(tyRange, c)
   result.n = n
   addSonSkipIntLit(result, intType) # basetype of range
@@ -405,10 +433,19 @@ proc illFormedAstLocal*(n: PNode; conf: ConfigRef) =
   localError(conf, n.info, errIllFormedAstX, renderTree(n, {renderNoComments}))
 
 proc checkSonsLen*(n: PNode, length: int; conf: ConfigRef) =
-  if sonsLen(n) != length: illFormedAst(n, conf)
+  if n.len != length: illFormedAst(n, conf)
 
 proc checkMinSonsLen*(n: PNode, length: int; conf: ConfigRef) =
-  if sonsLen(n) < length: illFormedAst(n, conf)
+  if n.len < length: illFormedAst(n, conf)
 
 proc isTopLevel*(c: PContext): bool {.inline.} =
   result = c.currentScope.depthLevel <= 2
+
+proc pushCaseContext*(c: PContext, caseNode: PNode) =
+  c.p.caseContext.add((caseNode, 0))
+
+proc popCaseContext*(c: PContext) =
+  discard pop(c.p.caseContext)
+
+proc setCaseContextIdx*(c: PContext, idx: int) =
+  c.p.caseContext[^1].idx = idx

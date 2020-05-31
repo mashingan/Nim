@@ -1,4 +1,6 @@
-import macros
+{.experimental: "notnil".}
+
+import macros, asyncmacro, asyncfutures
 
 block:
   template myAttr() {.pragma.}
@@ -11,8 +13,10 @@ block:
 block:
   template myAttr(a: string) {.pragma.}
 
-  type MyObj = object
-    myField1, myField2 {.myAttr: "hi".}: int
+  type
+    MyObj = object
+      myField1, myField2 {.myAttr: "hi".}: int
+
   var o: MyObj
   static:
     assert o.myField2.hasCustomPragma(myAttr)
@@ -22,7 +26,7 @@ import custom_pragma
 block: # A bit more advanced case
   type
     Subfield {.defaultValue: "catman".} = object
-      c* {.serializationKey: "cc".}: float
+      `c`* {.serializationKey: "cc".}: float
 
     MySerializable = object
       a {.serializationKey"asdf", defaultValue: 5.} : int
@@ -60,6 +64,11 @@ block: # A bit more advanced case
     assert(Subfield.getCustomPragmaVal(defaultValue) == "catman")
 
     assert hasCustomPragma(type(s.field), defaultValue)
+
+  proc foo(s: var MySerializable) =
+    static: assert(s.a.getCustomPragmaVal(defaultValue) == 5)
+
+  foo(s)
 
 block: # ref types
   type
@@ -175,24 +184,165 @@ var foo: Something
 foo.cardinal = north
 doAssert foo.b.hasCustomPragma(thingy) == true
 
-
-proc myproc(s: string): int = 
+proc myproc(s: string): int =
   {.thingy.}:
     s.len
 
 doAssert myproc("123") == 3
 
 let xx = compiles:
-  proc myproc_bad(s: string): int = 
+  proc myproc_bad(s: string): int =
     {.not_exist.}:
       s.len
 doAssert: xx == false
 
-
-macro checkSym(s: typed{nkSym}): untyped = 
+macro checkSym(s: typed{nkSym}): untyped =
   let body = s.getImpl.body
   doAssert body[1].kind == nnkPragmaBlock
   doAssert body[1][0].kind == nnkPragma
   doAssert body[1][0][0] == bindSym"thingy"
 
 checkSym(myproc)
+
+# var and let pragmas
+block:
+  template myAttr() {.pragma.}
+  template myAttr2(x: int) {.pragma.}
+  template myAttr3(x: string) {.pragma.}
+
+  type
+    MyObj2 = ref object
+    MyObjNotNil = MyObj2 not nil
+
+  let a {.myAttr,myAttr2(2),myAttr3:"test".}: int = 0
+  let b {.myAttr,myAttr2(2),myAttr3:"test".} = 0
+  var x {.myAttr,myAttr2(2),myAttr3:"test".}: int = 0
+  var y {.myAttr,myAttr2(2),myAttr3:"test".}: int
+  var z {.myAttr,myAttr2(2),myAttr3:"test".} = 0
+  var z2 {.myAttr.}: MyObjNotNil
+
+  template check(s: untyped) =
+    doAssert s.hasCustomPragma(myAttr)
+    doAssert s.hasCustomPragma(myAttr2)
+    doAssert s.getCustomPragmaVal(myAttr2) == 2
+    doAssert s.hasCustomPragma(myAttr3)
+    doAssert s.getCustomPragmaVal(myAttr3) == "test"
+
+  check(a)
+  check(b)
+  check(x)
+  check(y)
+  check(z)
+
+# pragma with multiple fields
+block:
+  template myAttr(first: string, second: int, third: float) {.pragma.}
+  let a {.myAttr("one", 2, 3.0).} = 0
+  let ps = a.getCustomPragmaVal(myAttr)
+  doAssert ps.first == ps[0] and ps.first == "one"
+  doAssert ps.second == ps[1] and ps.second == 2
+  doAssert ps.third == ps[2] and ps.third == 3.0
+
+# pragma with implicit&explicit generic types
+block:
+  template fooBar[T](x: T; c: static[int] = 42; m: char) {.pragma.}
+  var e {.fooBar("foo", 123, 'u').}: int
+  doAssert(hasCustomPragma(e, fooBar))
+  doAssert(getCustomPragmaVal(e, fooBar).c == 123)
+
+block:
+  macro expectedAst(expectedRepr: static[string], input: untyped): untyped =
+    assert input.treeRepr & "\n" == expectedRepr
+    return input
+
+  const procTypeAst = """
+ProcTy
+  FormalParams
+    Empty
+    IdentDefs
+      Ident "x"
+      Ident "int"
+      Empty
+  Pragma
+    Ident "async"
+"""
+
+  type
+    Foo = proc (x: int) {.expectedAst(procTypeAst), async.}
+
+  static: assert Foo is proc(x: int): Future[void]
+
+  const asyncProcTypeAst = """
+ProcTy
+  FormalParams
+    BracketExpr
+      Ident "Future"
+      Ident "void"
+    IdentDefs
+      Ident "s"
+      Ident "string"
+      Empty
+  Pragma
+"""
+
+  type
+    Bar = proc (s: string) {.async, expectedAst(asyncProcTypeAst).}
+
+  static: assert Bar is proc(x: string): Future[void]
+
+  const typeAst = """
+TypeDef
+  PragmaExpr
+    Ident "Baz"
+    Pragma
+  Empty
+  ObjectTy
+    Empty
+    Empty
+    RecList
+      IdentDefs
+        Ident "x"
+        Ident "string"
+        Empty
+"""
+
+  type
+    Baz {.expectedAst(typeAst).} = object
+      x: string
+
+  static: assert Baz.x is string
+
+  const procAst = """
+ProcDef
+  Ident "bar"
+  Empty
+  Empty
+  FormalParams
+    Ident "string"
+    IdentDefs
+      Ident "s"
+      Ident "string"
+      Empty
+  Empty
+  Empty
+  StmtList
+    ReturnStmt
+      Ident "s"
+"""
+
+  proc bar(s: string): string {.expectedAst(procAst).} =
+    return s
+
+  static: assert bar("x") == "x"
+
+#------------------------------------------------------
+# issue #13909
+
+template dependency*(id: string, weight = 0.0) {.pragma.}
+
+type
+  MyObject* = object
+    provider*: proc(obj: string): pointer {.dependency("Data/" & obj, 16.1), noSideEffect.}
+
+proc myproc(obj: string): string {.dependency("Data/" & obj, 16.1).} =
+  result = obj
